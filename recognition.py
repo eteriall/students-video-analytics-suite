@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple, Optional
 import cv2
 import numpy as np
 from retinaface import RetinaFace
+from deepface import DeepFace
 
 
 def placeholder_face(side: int = 320):
@@ -148,7 +149,20 @@ def cluster_color(cluster_id: int) -> Tuple[int, int, int]:
     return (int(255 * r), int(255 * g), int(255 * b))
 
 
-def draw_face_boxes(img, detections, clusters, scale: float = 1.0):
+def draw_face_boxes(img, detections, clusters, scale: float = 1.0, labels: Optional[List[str]] = None):
+    """
+    Draw bounding boxes around detected faces with optional labels.
+
+    Args:
+        img: Input image
+        detections: List of face detections
+        clusters: Cluster IDs for coloring
+        scale: Scaling factor for coordinates
+        labels: Optional list of labels to display below boxes
+
+    Returns:
+        Annotated image with bounding boxes and labels
+    """
     if img is None:
         return img
     if not detections:
@@ -167,6 +181,47 @@ def draw_face_boxes(img, detections, clusters, scale: float = 1.0):
         x1 = int(round((x + w) * scale))
         y1 = int(round((y + h) * scale))
         cv2.rectangle(annotated, (x0, y0), (x1, y1), color_bgr, thickness)
+
+        # Draw label below bounding box
+        if labels and idx < len(labels):
+            label_text = labels[idx]
+            if label_text:
+                # Calculate text size for background - much larger for visibility
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                # Much larger font scale (1.2-2.0 range) for better visibility on large images
+                font_scale = max(1.2, 1.5 * scale if scale > 0.5 else 1.2)
+                # Thicker text (2-4 pixels) for better readability
+                font_thickness = max(2, int(2 * scale))
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    label_text, font, font_scale, font_thickness
+                )
+
+                # Position text below the box with more padding
+                text_x = x0
+                text_y = y1 + text_height + 10
+
+                # Draw background rectangle for text with padding (black background)
+                padding = 6
+                bg_x1 = text_x - padding // 2
+                bg_y1 = y1 + 4
+                bg_x2 = text_x + text_width + padding
+                bg_y2 = text_y + baseline + padding
+
+                # Black background for better contrast
+                cv2.rectangle(annotated, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
+
+                # Draw text with padding (white text on black)
+                cv2.putText(
+                    annotated,
+                    label_text,
+                    (text_x + padding // 4, text_y + padding // 4),
+                    font,
+                    font_scale,
+                    (255, 255, 255),  # White text
+                    font_thickness,
+                    cv2.LINE_AA
+                )
+
         cx = int(round((x + w / 2.0) * scale))
         cy = int(round((y + h / 2.0) * scale))
         cluster_nodes.setdefault(cluster_id, []).append({"index": idx, "center": (cx, cy), "color": color_bgr})
@@ -200,24 +255,113 @@ def draw_face_boxes(img, detections, clusters, scale: float = 1.0):
     return annotated
 
 
-def compute_face_embedding(face_img: Optional[np.ndarray]) -> np.ndarray:
+def compute_face_embedding(face_img: Optional[np.ndarray], model_name: str = "Facenet512") -> np.ndarray:
+    """
+    Compute face embedding using DeepFace with specified model.
+
+    Args:
+        face_img: Face image crop (BGR format)
+        model_name: Model to use. Options:
+            - "Facenet512" (default, 512-dim, best accuracy)
+            - "Facenet" (128-dim, faster)
+            - "VGG-Face" (2622-dim, robust)
+            - "ArcFace" (512-dim, excellent for matching)
+            - "SFace" (128-dim, fastest)
+
+    Returns:
+        Normalized embedding vector
+    """
     if face_img is None or face_img.size == 0:
-        return np.zeros(1024 + 96, dtype=np.float32)
-    resized = cv2.resize(face_img, (112, 112), interpolation=cv2.INTER_AREA)
-    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
-    hists = []
-    for channel in cv2.split(lab):
-        hist = cv2.calcHist([channel], [0], None, [32], [0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        hists.append(hist.astype(np.float32))
-    gray_small = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    gray_small = cv2.resize(gray_small, (32, 32), interpolation=cv2.INTER_AREA)
-    gray_norm = gray_small.astype(np.float32) / 255.0
-    features = np.concatenate([gray_norm.flatten(), *hists]).astype(np.float32)
-    norm = np.linalg.norm(features)
-    if norm > 1e-12:
-        features /= norm
-    return features
+        # Return zero embedding with appropriate dimension
+        dim_map = {
+            "Facenet512": 512,
+            "Facenet": 128,
+            "VGG-Face": 2622,
+            "ArcFace": 512,
+            "SFace": 128,
+        }
+        dim = dim_map.get(model_name, 512)
+        return np.zeros(dim, dtype=np.float32)
+
+    try:
+        # DeepFace expects RGB format
+        face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
+        # Generate embedding using DeepFace
+        # enforce_detection=False since we already have a detected face
+        embedding_objs = DeepFace.represent(
+            img_path=face_rgb,
+            model_name=model_name,
+            enforce_detection=False,
+            detector_backend="skip",  # Skip detection since we already have the face
+            align=True,  # Align face for better accuracy
+        )
+
+        # DeepFace.represent returns a list of dicts, get the first one
+        if embedding_objs and len(embedding_objs) > 0:
+            embedding = np.array(embedding_objs[0]["embedding"], dtype=np.float32)
+            # Normalize the embedding for cosine similarity
+            norm = np.linalg.norm(embedding)
+            if norm > 1e-12:
+                embedding /= norm
+            return embedding
+        else:
+            # Fallback to zero embedding
+            dim_map = {
+                "Facenet512": 512,
+                "Facenet": 128,
+                "VGG-Face": 2622,
+                "ArcFace": 512,
+                "SFace": 128,
+            }
+            dim = dim_map.get(model_name, 512)
+            return np.zeros(dim, dtype=np.float32)
+
+    except Exception as e:
+        print(f"Embedding computation error: {e}")
+        # Fallback to zero embedding
+        dim_map = {
+            "Facenet512": 512,
+            "Facenet": 128,
+            "VGG-Face": 2622,
+            "ArcFace": 512,
+            "SFace": 128,
+        }
+        dim = dim_map.get(model_name, 512)
+        return np.zeros(dim, dtype=np.float32)
+
+
+def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
+    """
+    Compute cosine similarity between two embeddings.
+
+    Returns:
+        Similarity score (1.0 = identical, 0.0 = orthogonal, -1.0 = opposite)
+    """
+    if emb1.size == 0 or emb2.size == 0:
+        return 0.0
+
+    # Normalize if not already normalized
+    norm1 = np.linalg.norm(emb1)
+    norm2 = np.linalg.norm(emb2)
+
+    if norm1 < 1e-12 or norm2 < 1e-12:
+        return 0.0
+
+    emb1_norm = emb1 / norm1
+    emb2_norm = emb2 / norm2
+
+    return float(np.dot(emb1_norm, emb2_norm))
+
+
+def cosine_distance(emb1: np.ndarray, emb2: np.ndarray) -> float:
+    """
+    Compute cosine distance (1 - cosine_similarity).
+
+    Returns:
+        Distance score (0.0 = identical, 2.0 = opposite)
+    """
+    return 1.0 - cosine_similarity(emb1, emb2)
 
 
 @dataclass
@@ -240,6 +384,13 @@ class FaceProfile:
     occurrences: List[FaceOccurrence] = field(default_factory=list, repr=False)
 
     def add_occurrence(self, occurrence: FaceOccurrence):
+        # Check if this occurrence already exists (same image path and detection index)
+        for existing_occ in self.occurrences:
+            if (existing_occ.image_path == occurrence.image_path and
+                existing_occ.detection_index == occurrence.detection_index):
+                # Already exists, don't add duplicate
+                return
+
         self.occurrences.append(occurrence)
         emb = occurrence.embedding.astype(np.float32)
         if self.embedding_sum.size == 0:
@@ -247,9 +398,10 @@ class FaceProfile:
         else:
             self.embedding_sum += emb
         self.occurrence_count += 1
-        x, y, w, h = occurrence.box
-        area = w * h
-        if area > self.representative_area and occurrence.face_image is not None and occurrence.face_image.size > 0:
+        # Always use the last (most recent) occurrence as representative face
+        if occurrence.face_image is not None and occurrence.face_image.size > 0:
+            x, y, w, h = occurrence.box
+            area = w * h
             self.representative_face = occurrence.face_image.copy()
             self.representative_area = area
 
@@ -279,22 +431,43 @@ class FaceProfile:
             return True
         self.embedding_sum = np.sum([occ.embedding for occ in remaining], axis=0).astype(np.float32)
         self.occurrence_count = len(remaining)
-        self.representative_face = None
-        self.representative_area = 0
-        for occ in remaining:
-            x, y, w, h = occ.box
-            area = w * h
-            if area > self.representative_area and occ.face_image is not None and occ.face_image.size > 0:
-                self.representative_face = occ.face_image.copy()
-                self.representative_area = area
+        # Use the last (most recent) occurrence as representative face
+        if remaining:
+            last_occ = remaining[-1]
+            if last_occ.face_image is not None and last_occ.face_image.size > 0:
+                x, y, w, h = last_occ.box
+                self.representative_face = last_occ.face_image.copy()
+                self.representative_area = w * h
+            else:
+                self.representative_face = None
+                self.representative_area = 0
         return True
 
 
 class FaceProfileManager:
-    def __init__(self, distance_threshold: float = 0.38):
+    def __init__(
+        self,
+        distance_threshold: float = 0.4,
+        model_name: str = "Facenet512",
+        use_cosine: bool = True
+    ):
+        """
+        Initialize FaceProfileManager with improved matching.
+
+        Args:
+            distance_threshold: Maximum distance for profile matching
+                - For cosine distance: 0.3-0.5 (default 0.4)
+                - For L2 distance: depends on embedding dimension
+            model_name: DeepFace model to use for embeddings
+            use_cosine: Use cosine distance (True) or L2 distance (False)
+        """
         self.distance_threshold = distance_threshold
+        self.model_name = model_name
+        self.use_cosine = use_cosine
         self._profiles: Dict[int, FaceProfile] = {}
         self._next_profile_id = 1
+        # Cache for normalized embeddings to speed up matching
+        self._embedding_cache: Dict[int, np.ndarray] = {}
 
     def profiles(self) -> List[FaceProfile]:
         return list(self._profiles.values())
@@ -303,27 +476,75 @@ class FaceProfileManager:
         return self._profiles.get(profile_id)
 
     def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[int], float]:
+        """
+        Find the best matching profile for an embedding using optimized distance calculation.
+
+        Returns:
+            Tuple of (profile_id, distance) or (None, inf) if no match
+        """
         if embedding is None or embedding.size == 0:
             return None, float("inf")
+
         best_id = None
         best_dist = float("inf")
-        for pid, profile in self._profiles.items():
-            avg_emb = profile.average_embedding()
-            if avg_emb.size == 0:
-                continue
-            dist = np.linalg.norm(avg_emb - embedding)
-            if dist < best_dist:
-                best_dist = dist
-                best_id = pid
-        return best_id, best_dist
+
+        # Vectorize distance calculation for better performance
+        if self._profiles:
+            profile_ids = []
+            embeddings = []
+
+            for pid, profile in self._profiles.items():
+                # Use cached normalized embedding if available
+                if pid not in self._embedding_cache:
+                    avg_emb = profile.average_embedding()
+                    if avg_emb.size == 0:
+                        continue
+                    # Normalize and cache
+                    norm = np.linalg.norm(avg_emb)
+                    if norm > 1e-12:
+                        self._embedding_cache[pid] = avg_emb / norm
+                    else:
+                        continue
+
+                profile_ids.append(pid)
+                embeddings.append(self._embedding_cache[pid])
+
+            if embeddings:
+                embeddings_matrix = np.array(embeddings)
+
+                if self.use_cosine:
+                    # Cosine distance: more robust for deep learning embeddings
+                    # Normalize query embedding
+                    norm = np.linalg.norm(embedding)
+                    if norm > 1e-12:
+                        embedding_norm = embedding / norm
+                        # Compute cosine similarity with all profiles at once
+                        similarities = np.dot(embeddings_matrix, embedding_norm)
+                        distances = 1.0 - similarities
+                        best_idx = np.argmin(distances)
+                        best_dist = distances[best_idx]
+                        best_id = profile_ids[best_idx]
+                else:
+                    # L2 distance: traditional Euclidean distance
+                    distances = np.linalg.norm(embeddings_matrix - embedding, axis=1)
+                    best_idx = np.argmin(distances)
+                    best_dist = distances[best_idx]
+                    best_id = profile_ids[best_idx]
+
+        return best_id, float(best_dist)
 
     def assign_profile(self, occurrence: FaceOccurrence) -> FaceProfile:
         emb = occurrence.embedding
         match_id, dist = self._find_best_match(emb)
+
         if match_id is None or dist > self.distance_threshold:
             profile = self._create_profile()
         else:
             profile = self._profiles[match_id]
+            # Invalidate cache for this profile since it's being updated
+            if match_id in self._embedding_cache:
+                del self._embedding_cache[match_id]
+
         profile.add_occurrence(occurrence)
         return profile
 
@@ -337,6 +558,7 @@ class FaceProfileManager:
     def reset(self):
         self._profiles.clear()
         self._next_profile_id = 1
+        self._embedding_cache.clear()
 
     def remove_image_occurrences(self, image_path: str) -> bool:
         changed = False
@@ -344,8 +566,92 @@ class FaceProfileManager:
         for pid, profile in self._profiles.items():
             if profile.remove_occurrences_for_image(image_path):
                 changed = True
+                # Invalidate cache for this profile
+                if pid in self._embedding_cache:
+                    del self._embedding_cache[pid]
                 if profile.occurrence_count == 0:
                     empty_profiles.append(pid)
         for pid in empty_profiles:
             del self._profiles[pid]
+            if pid in self._embedding_cache:
+                del self._embedding_cache[pid]
         return changed
+
+    def rename_profile(self, profile_id: int, new_label: str) -> bool:
+        """
+        Rename a profile with a new label.
+
+        Args:
+            profile_id: ID of profile to rename
+            new_label: New label/name for the profile
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        profile = self._profiles.get(profile_id)
+        if not profile:
+            return False
+        profile.label = new_label
+        return True
+
+    def merge_profiles(self, source_id: int, target_id: int) -> bool:
+        """
+        Merge source profile into target profile.
+
+        All occurrences from source profile are moved to target profile,
+        and source profile is deleted.
+
+        Args:
+            source_id: Profile ID to merge from (will be deleted)
+            target_id: Profile ID to merge into (will be kept)
+
+        Returns:
+            True if merged successfully, False otherwise
+        """
+        if source_id == target_id:
+            return False
+
+        source = self._profiles.get(source_id)
+        target = self._profiles.get(target_id)
+
+        if not source or not target:
+            return False
+
+        # Move all occurrences from source to target
+        for occurrence in source.occurrences:
+            target.add_occurrence(occurrence)
+
+        # Delete source profile
+        del self._profiles[source_id]
+
+        # Invalidate caches for both profiles
+        if source_id in self._embedding_cache:
+            del self._embedding_cache[source_id]
+        if target_id in self._embedding_cache:
+            del self._embedding_cache[target_id]
+
+        return True
+
+    def find_profile_by_label(self, label: str) -> Optional[int]:
+        """
+        Find a profile ID by its label.
+
+        Args:
+            label: Label to search for
+
+        Returns:
+            Profile ID if found, None otherwise
+        """
+        for pid, profile in self._profiles.items():
+            if profile.label == label:
+                return pid
+        return None
+
+    def get_all_labels(self) -> List[str]:
+        """
+        Get all unique profile labels.
+
+        Returns:
+            List of all profile labels
+        """
+        return [profile.label for profile in self._profiles.values()]

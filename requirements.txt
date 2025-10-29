@@ -1,4 +1,5 @@
 PyQt5
 opencv-python
 numpy
-retinaface
+deepface
+tf-keras
