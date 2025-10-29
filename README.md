@@ -1,9 +1,10 @@
 # Students Video Analytics Suite (SVAS)
 
-<img width="3356" height="2100" alt="image" src="https://github.com/user-attachments/assets/7f66340f-74b9-4ae3-bf42-a0caa5a4811a" />
-
 **Students Video Analytics Suite (SVAS)** is a research-oriented toolset developed by **Copernicus Berlin e.V.** for analyzing group behavior and participant engagement during Erasmus+ training courses.
 It uses computer vision to interpret classroom or seminar video data, helping facilitators understand participants’ attention, collaboration, and emotional background throughout the learning process.
+
+
+<img width="3356" height="2100" style="margin: 20px" alt="image" src="https://github.com/user-attachments/assets/7f66340f-74b9-4ae3-bf42-a0caa5a4811a" />
 
 ---
 
