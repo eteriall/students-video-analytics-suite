@@ -38,6 +38,9 @@ The suite operates entirely **within the device and organizational network bound
 5. **Emotional Background Estimation**
    Interprets visible emotional states throughout the training period to provide facilitators with a nuanced understanding of participants’ comfort and engagement.
 
+6. **Group images / Portraits sorting**
+   Sorts pictures into directories by amount of people on them.
+
 ---
 
 ## Ethical and Data Protection Standards
