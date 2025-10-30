@@ -50,6 +50,7 @@ from projects import ProjectManager, Project, ProjectSettings
 from project_dialogs import ProjectDialog, ProjectSelectionDialog, CampusCredentialsDialog
 from quality_review_dialog import QualityReviewDialog
 from histogram_dialog import FaceCountHistogramDialog
+from face_analysis_dialog import FaceAnalysisDialog
 
 
 class LoadingSpinner(QLabel):
@@ -977,6 +978,7 @@ class ProfilePanel(QWidget):
     occurrenceActivated = pyqtSignal(str, int)
     profileRenamed = pyqtSignal(int, str)  # profile_id, new_name
     seeAllFacesClicked = pyqtSignal()  # Signal to open faces window
+    processImagesRequested = pyqtSignal(int)  # profile_id to process
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1068,9 +1070,45 @@ class ProfilePanel(QWidget):
 
         layout.addWidget(sort_widget)
         layout.addWidget(self.profile_list, 1)
+
+        # Appearances header with Process button
+        appearances_header = QWidget()
+        appearances_layout = QHBoxLayout(appearances_header)
+        appearances_layout.setContentsMargins(0, 0, 0, 0)
+        appearances_layout.setSpacing(8)
+
         self.occurrences_title = QLabel("Appearances")
         self.occurrences_title.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.occurrences_title)
+
+        self.process_images_btn = QPushButton("Process Images")
+        self.process_images_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2e7d32;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 3px;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background-color: #388e3c;
+            }
+            QPushButton:pressed {
+                background-color: #1b5e20;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+            }
+        """)
+        self.process_images_btn.setEnabled(False)
+        self.process_images_btn.clicked.connect(self._on_process_images)
+        self.process_images_btn.setToolTip("Analyze emotions and gaze direction for this person")
+
+        appearances_layout.addWidget(self.occurrences_title)
+        appearances_layout.addStretch()
+        appearances_layout.addWidget(self.process_images_btn)
+
+        layout.addWidget(appearances_header)
         layout.addWidget(self.occurrence_list, 1)
         self._profiles = {}
         self._suspend_signals = False
@@ -1161,6 +1199,8 @@ class ProfilePanel(QWidget):
     def _on_profile_selection(self):
         profile_id = self.current_profile_id()
         self._populate_occurrences(profile_id)
+        # Enable/disable Process Images button
+        self.process_images_btn.setEnabled(profile_id is not None)
         if self._suspend_signals or profile_id is None:
             return
         self.profileSelected.emit(profile_id)
@@ -1302,6 +1342,12 @@ class ProfilePanel(QWidget):
     def _on_see_all_clicked(self):
         """Handle 'See all faces' button click"""
         self.seeAllFacesClicked.emit()
+
+    def _on_process_images(self):
+        """Handle 'Process Images' button click"""
+        profile_id = self.current_profile_id()
+        if profile_id is not None:
+            self.processImagesRequested.emit(profile_id)
 
 
 class FacesWindow(QMainWindow):
@@ -2022,6 +2068,7 @@ class MainWindow(QMainWindow):
         self.profile_panel.occurrenceActivated.connect(self.on_occurrence_activated)
         self.profile_panel.profileRenamed.connect(self.on_profile_renamed)
         self.profile_panel.seeAllFacesClicked.connect(self.on_see_all_faces)
+        self.profile_panel.processImagesRequested.connect(self.on_process_images)
         splitter = QSplitter()
         splitter.addWidget(left)
         splitter.addWidget(self.panel)
@@ -2415,8 +2462,11 @@ class MainWindow(QMainWindow):
                             detection_index=det_data['detection_index'],
                             box=(det_data['box_x'], det_data['box_y'], det_data['box_w'], det_data['box_h']),
                             embedding=det_data['embedding'],
-                            face_image=det_data.get('face_image')
+                            face_image=det_data.get('face_image'),
+                            emotion=det_data.get('emotion'),
+                            gaze_direction=det_data.get('gaze_direction')
                         )
+                        occurrence.detection_id = det_data.get('id')
                         profile.add_occurrence(occurrence)
 
                     # Add profile to manager
@@ -2528,8 +2578,11 @@ class MainWindow(QMainWindow):
                             detection_index=det_data['detection_index'],
                             box=(det_data['box_x'], det_data['box_y'], det_data['box_w'], det_data['box_h']),
                             embedding=det_data['embedding'],
-                            face_image=det_data.get('face_image')
+                            face_image=det_data.get('face_image'),
+                            emotion=det_data.get('emotion'),
+                            gaze_direction=det_data.get('gaze_direction')
                         )
+                        occurrence.detection_id = det_data.get('id')
                         profile.add_occurrence(occurrence)
 
                     # Add profile to manager
@@ -3533,6 +3586,28 @@ class MainWindow(QMainWindow):
         self.faces_window.show()
         self.faces_window.raise_()
         self.faces_window.activateWindow()
+
+    def on_process_images(self, profile_id):
+        """Open face analysis dialog for a profile"""
+        profile = self.profile_manager.get_profile(profile_id)
+        if not profile:
+            QMessageBox.warning(self, "Error", "Profile not found")
+            return
+
+        if len(profile.occurrences) == 0:
+            QMessageBox.information(
+                self,
+                "No Images",
+                f"No images found for {profile.label}.\nAdd some images first."
+            )
+            return
+
+        # Open analysis dialog
+        dialog = FaceAnalysisDialog(profile, self.db, parent=self)
+        dialog.exec_()
+
+        # Refresh display in case data changed
+        self.profile_panel.set_profiles(self.profile_manager.profiles())
 
     def on_appearance_reassigned(self, old_profile_id, image_path, detection_index, new_name):
         """Handle reassignment of an appearance to a different person"""
