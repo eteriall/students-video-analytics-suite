@@ -260,11 +260,22 @@ class ProjectManager:
         settings_data = json.loads(row['settings']) if row['settings'] else {}
         settings = ProjectSettings.from_dict(settings_data)
 
+        # Safely get new columns (for backwards compatibility)
+        try:
+            fetch_from_campus = bool(row['fetch_from_campus'])
+        except (KeyError, IndexError):
+            fetch_from_campus = False
+
+        try:
+            max_people = row['max_people']
+        except (KeyError, IndexError):
+            max_people = None
+
         return Project(
             id=row['id'],
             name=row['name'],
-            fetch_from_campus=bool(row.get('fetch_from_campus', False)),
-            max_people=row.get('max_people'),
+            fetch_from_campus=fetch_from_campus,
+            max_people=max_people,
             start_date=row['start_date'],
             end_date=row['end_date'],
             location=row['location'],
