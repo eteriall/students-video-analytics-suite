@@ -29,6 +29,10 @@ from PyQt5.QtWidgets import (
     QSplashScreen,
     QStackedLayout,
     QDialog,
+    QMenuBar,
+    QMenu,
+    QAction,
+    QStatusBar,
 )
 
 from recognition import (
@@ -42,6 +46,8 @@ from recognition import (
 )
 from utils import cv_to_qpixmap
 from database import FaceDatabase
+from projects import ProjectManager, Project, ProjectSettings
+from project_dialogs import ProjectDialog, ProjectSelectionDialog, CampusCredentialsDialog
 
 
 class LoadingSpinner(QLabel):
@@ -100,10 +106,15 @@ class DatabaseLoadWorker(QThread):
 
     def run(self):
         try:
-            from recognition import FaceOccurrence, cluster_detections, draw_face_boxes
+            from recognition import FaceOccurrence, cluster_detections, draw_face_boxes, normalize_face
 
-            # Get detections from database
-            detections_data = self.db.get_detections_for_image(self.image_id)
+            # Get detections from database WITHOUT loading embeddings or face images
+            # This significantly speeds up loading by skipping pickle deserialization
+            detections_data = self.db.get_detections_for_image(
+                self.image_id,
+                load_embeddings=False,  # Skip embedding deserialization - not needed for display
+                load_face_images=False  # Skip face image deserialization - crop from main image instead
+            )
             if not detections_data:
                 self.error.emit(self.path, "No detections found in database")
                 return
@@ -133,29 +144,31 @@ class DatabaseLoadWorker(QThread):
                 }
                 detections.append(detection)
 
-                # Get face image from database or crop from original
-                if det_data.get('face_image') is not None:
-                    face_img = det_data['face_image']
+                # Crop face from original image (much faster than deserializing from DB)
+                if y+h <= img.shape[0] and x+w <= img.shape[1] and w > 0 and h > 0:
+                    face_crop = img[y:y+h, x:x+w].copy()
+                    # Normalize face to consistent size for display
+                    face_img = normalize_face(face_crop, side=320)
                 else:
-                    # Fallback: crop from original image
-                    face_img = img[y:y+h, x:x+w].copy() if y+h <= img.shape[0] and x+w <= img.shape[1] else None
+                    face_img = np.empty(0)
 
-                if face_img is not None:
-                    faces.append(face_img)
-                else:
-                    faces.append(np.empty(0))
+                faces.append(face_img)
 
                 # Profile ID
                 profile_ids.append(det_data.get('profile_id'))
 
-                # Reconstruct FaceOccurrence
+                # Reconstruct FaceOccurrence with lazy embedding loading
+                # Store detection ID for lazy embedding loading if needed later
                 occurrence = FaceOccurrence(
                     image_path=self.path,
                     detection_index=det_data['detection_index'],
                     box=box,
-                    embedding=det_data['embedding'],
+                    embedding=None,  # Don't load embedding yet - lazy load when needed
                     face_image=face_img
                 )
+                # Store detection ID for lazy loading
+                occurrence.detection_id = det_data['id']
+                occurrence.embedding_blob = det_data.get('embedding_blob')  # Keep blob reference
                 occurrences.append(occurrence)
 
             # Cluster detections
@@ -178,6 +191,7 @@ class DatabaseLoadWorker(QThread):
                 "clusters": clusters,
                 "profile_ids": profile_ids,
                 "occurrences": occurrences,
+                "_last_labels": labels,  # Cache labels for optimization in _refresh_entry_annotations
             }
 
             self.finished.emit(self.path, entry)
@@ -1002,6 +1016,46 @@ class ProfilePanel(QWidget):
         header_layout.addWidget(self.see_all_btn)
 
         layout.addWidget(header_widget)
+
+        # Sorting controls
+        sort_widget = QWidget()
+        sort_layout = QHBoxLayout(sort_widget)
+        sort_layout.setContentsMargins(0, 0, 0, 0)
+        sort_layout.setSpacing(8)
+
+        sort_label = QLabel("Sort by:")
+        sort_label.setStyleSheet("font-size: 10px; color: #888;")
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Default", "default")
+        self.sort_combo.addItem("Most appearances", "most_appearances")
+        self.sort_combo.addItem("Least appearances", "least_appearances")
+        self.sort_combo.addItem("Name (A-Z)", "name_asc")
+        self.sort_combo.addItem("Name (Z-A)", "name_desc")
+        self.sort_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #4a4a4a;
+                color: white;
+                border: none;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-size: 10px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #4a4a4a;
+                color: white;
+                selection-background-color: #5a5a5a;
+            }
+        """)
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+
+        sort_layout.addWidget(sort_label)
+        sort_layout.addWidget(self.sort_combo, 1)
+
+        layout.addWidget(sort_widget)
         layout.addWidget(self.profile_list, 1)
         self.occurrences_title = QLabel("Appearances")
         self.occurrences_title.setStyleSheet("font-weight: 600;")
@@ -1011,8 +1065,44 @@ class ProfilePanel(QWidget):
         self._suspend_signals = False
         self._editing_item = None
         self._edit_widget = None
+        self._all_profiles = []  # Store all profiles for sorting
+
+    def _on_sort_changed(self):
+        """Handle sort option change."""
+        if not self._all_profiles:
+            return
+        # Re-apply profiles with current sort
+        self.set_profiles(self._all_profiles)
+
+    def _sort_profiles(self, profiles):
+        """Sort profiles based on current sort selection."""
+        sort_key = self.sort_combo.currentData()
+
+        if sort_key == "default":
+            # Default order (by profile_id)
+            return sorted(profiles, key=lambda p: p.profile_id)
+        elif sort_key == "most_appearances":
+            # Sort by occurrence count descending
+            return sorted(profiles, key=lambda p: p.occurrence_count, reverse=True)
+        elif sort_key == "least_appearances":
+            # Sort by occurrence count ascending
+            return sorted(profiles, key=lambda p: p.occurrence_count)
+        elif sort_key == "name_asc":
+            # Sort by label A-Z
+            return sorted(profiles, key=lambda p: p.label.lower())
+        elif sort_key == "name_desc":
+            # Sort by label Z-A
+            return sorted(profiles, key=lambda p: p.label.lower(), reverse=True)
+        else:
+            return profiles
 
     def set_profiles(self, profiles):
+        # Store all profiles for sorting
+        self._all_profiles = list(profiles)
+
+        # Apply sorting
+        sorted_profiles = self._sort_profiles(profiles)
+
         selected_id = self.current_profile_id()
         current_occurrence = None
         current_item = self.occurrence_list.currentItem()
@@ -1022,9 +1112,11 @@ class ProfilePanel(QWidget):
         self.profile_list.blockSignals(True)
         self.profile_list.clear()
         self.profile_list.blockSignals(False)
-        self._profiles = {p.profile_id: p for p in profiles}
-        for profile in profiles:
-            item = QListWidgetItem(profile.label)
+        self._profiles = {p.profile_id: p for p in sorted_profiles}
+        for profile in sorted_profiles:
+            # Show profile label with occurrence count
+            label_text = f"{profile.label} ({profile.occurrence_count})"
+            item = QListWidgetItem(label_text)
             item.setData(Qt.UserRole, profile.profile_id)
             face_img = profile.representative_face
             if face_img is not None and getattr(face_img, "size", 0):
@@ -1909,7 +2001,22 @@ class MainWindow(QMainWindow):
         root_layout = QHBoxLayout(container)
         root_layout.addWidget(splitter)
         self.setCentralWidget(container)
-        # Initialize database
+
+        # Initialize project management
+        self.project_manager = ProjectManager()
+        self.current_project = None
+        self._is_startup = True  # Flag to track if we're in startup phase
+
+        # Create menu bar
+        self._create_menu_bar()
+
+        # Create status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.project_label = QLabel("No project")
+        self.status_bar.addPermanentWidget(self.project_label)
+
+        # Initialize database (will be overridden when project is selected)
         self.db = FaceDatabase()
 
         # Local storage for imported images
@@ -1934,10 +2041,15 @@ class MainWindow(QMainWindow):
         self.is_blurred = False
         self.current_image_path = None
         self.analysis_cache = {}
+
+        # Get max_people from current project if available
+        max_people = self.current_project.max_people if self.current_project else None
+
         self.profile_manager = FaceProfileManager(
             distance_threshold=self.distance_threshold,
             model_name=self.recognition_model,
-            use_cosine=True
+            use_cosine=True,
+            max_people=max_people
         )
         self.pending_highlight = None
 
@@ -1948,8 +2060,293 @@ class MainWindow(QMainWindow):
         # Faces window
         self.faces_window = None
 
-        # Load existing data from database
+        # Show project selection on startup after window is visible
+        QTimer.singleShot(100, self._show_startup_project_selection)
+
+    def _show_startup_project_selection(self):
+        """Show project selection dialog on application startup."""
+        projects = self.project_manager.get_all_projects()
+
+        if projects:
+            # Show project selection dialog
+            dialog = ProjectSelectionDialog(projects, parent=self)
+            dialog.setWindowTitle("Welcome - Select Project")
+
+            # Customize button text
+            if hasattr(dialog, 'new_btn'):
+                dialog.new_btn.setText("Create New Project")
+
+            result = dialog.exec_()
+
+            if result == QDialog.Accepted:
+                project = dialog.get_selected_project()
+                if project:
+                    self._switch_to_project(project)
+                else:
+                    # Fallback to default
+                    self.load_from_database()
+            elif dialog.wants_new_project():
+                # User clicked "New Project" button
+                self._on_new_project()
+                # If still no project after dialog, load default database
+                if not self.current_project:
+                    self.load_from_database()
+            else:
+                # User clicked Cancel - ask what to do
+                reply = QMessageBox.question(
+                    self,
+                    "Continue Without Project?",
+                    "Would you like to continue without a project or exit?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+
+                if reply == QMessageBox.Yes:
+                    # Continue without project (use default database)
+                    self.load_from_database()
+                else:
+                    # Exit application
+                    QApplication.quit()
+                    return
+        else:
+            # No projects exist - prompt to create first project
+            reply = QMessageBox.question(
+                self,
+                "Welcome to Face Gallery",
+                "No projects found. Would you like to create your first project?\n\n"
+                "Projects help organize your face recognition work by event or group.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if reply == QMessageBox.Yes:
+                self._on_new_project()
+                # If user canceled project creation, load default database
+                if not self.current_project:
+                    self.load_from_database()
+            else:
+                # Continue without project
+                self.load_from_database()
+
+        # Startup complete
+        self._is_startup = False
+
+    def _create_menu_bar(self):
+        """Create menu bar with project management."""
+        menubar = self.menuBar()
+
+        # Project menu
+        project_menu = menubar.addMenu("&Project")
+
+        new_project_action = QAction("&New Project...", self)
+        new_project_action.setShortcut("Ctrl+N")
+        new_project_action.triggered.connect(self._on_new_project)
+        project_menu.addAction(new_project_action)
+
+        open_project_action = QAction("&Open Project...", self)
+        open_project_action.setShortcut("Ctrl+O")
+        open_project_action.triggered.connect(self._on_open_project)
+        project_menu.addAction(open_project_action)
+
+        project_menu.addSeparator()
+
+        edit_project_action = QAction("&Edit Current Project...", self)
+        edit_project_action.triggered.connect(self._on_edit_project)
+        project_menu.addAction(edit_project_action)
+        self.edit_project_action = edit_project_action
+
+        close_project_action = QAction("&Close Project", self)
+        close_project_action.triggered.connect(self._on_close_project)
+        project_menu.addAction(close_project_action)
+        self.close_project_action = close_project_action
+
+        project_menu.addSeparator()
+
+        delete_project_action = QAction("&Delete Project...", self)
+        delete_project_action.triggered.connect(self._on_delete_project)
+        project_menu.addAction(delete_project_action)
+
+        # Initially disable project-specific actions
+        self.edit_project_action.setEnabled(False)
+        self.close_project_action.setEnabled(False)
+
+    def _update_project_ui(self):
+        """Update UI to reflect current project state."""
+        if self.current_project:
+            # Update window title
+            self.setWindowTitle(f"Face Gallery - {self.current_project.name}")
+            # Update status bar
+            self.project_label.setText(f"Project: {self.current_project.name}")
+            # Enable project actions
+            self.edit_project_action.setEnabled(True)
+            self.close_project_action.setEnabled(True)
+        else:
+            self.setWindowTitle("Face Gallery")
+            self.project_label.setText("No project")
+            self.edit_project_action.setEnabled(False)
+            self.close_project_action.setEnabled(False)
+
+    def _on_new_project(self):
+        """Create a new project."""
+        dialog = ProjectDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            project = dialog.get_project()
+            # Save project to database
+            project_id = self.project_manager.create_project(project)
+            project.id = project_id
+            # Switch to new project
+            self._switch_to_project(project)
+
+    def _on_open_project(self):
+        """Open an existing project."""
+        projects = self.project_manager.get_all_projects()
+        if not projects:
+            reply = QMessageBox.question(
+                self,
+                "No Projects",
+                "No projects found. Would you like to create a new project?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self._on_new_project()
+            return
+
+        dialog = ProjectSelectionDialog(projects, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            project = dialog.get_selected_project()
+            if project:
+                self._switch_to_project(project)
+
+    def _on_edit_project(self):
+        """Edit current project."""
+        if not self.current_project:
+            return
+
+        dialog = ProjectDialog(project=self.current_project, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            updated_project = dialog.get_project()
+            # Save updates
+            self.project_manager.update_project(updated_project)
+            self.current_project = updated_project
+            self._update_project_ui()
+
+            # Update settings if they changed
+            if self.current_project.settings:
+                self.detection_threshold = self.current_project.settings.detection_threshold
+                self.distance_threshold = self.current_project.settings.distance_threshold
+                self.recognition_model = self.current_project.settings.model_name
+                self.model_selector.setCurrentText(self.recognition_model)
+                # Update profile manager
+                self.profile_manager.distance_threshold = self.distance_threshold
+                self.profile_manager.model_name = self.recognition_model
+                self.profile_manager.use_cosine = self.current_project.settings.use_cosine
+                self.profile_manager.max_people = self.current_project.max_people
+
+    def _on_close_project(self):
+        """Close current project."""
+        if not self.current_project:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Close Project",
+            f"Close project '{self.current_project.name}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Save any pending changes
+            self._save_current_state()
+            # Clear current project
+            self.current_project = None
+            # Reset to default database
+            self.db = FaceDatabase()
+            # Clear UI
+            self.gallery.clear()
+            self.images.clear()
+            self.analysis_cache.clear()
+            self.profile_manager.reset()
+            self.profile_panel.set_profiles([])
+            self._update_project_ui()
+
+    def _on_delete_project(self):
+        """Delete a project."""
+        projects = self.project_manager.get_all_projects()
+        if not projects:
+            QMessageBox.information(self, "No Projects", "No projects to delete.")
+            return
+
+        dialog = ProjectSelectionDialog(projects, parent=self)
+        dialog.setWindowTitle("Delete Project")
+        if dialog.exec_() == QDialog.Accepted:
+            project = dialog.get_selected_project()
+            if project:
+                reply = QMessageBox.question(
+                    self,
+                    "Delete Project",
+                    f"Are you sure you want to delete project '{project.name}'?\n\n"
+                    f"This will remove the project metadata but not the database file.\n"
+                    f"This action cannot be undone.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+
+                if reply == QMessageBox.Yes:
+                    # If deleting current project, close it first
+                    if self.current_project and self.current_project.id == project.id:
+                        self._on_close_project()
+
+                    # Delete project
+                    self.project_manager.delete_project(project.id)
+                    QMessageBox.information(self, "Success", f"Project '{project.name}' deleted.")
+
+    def _switch_to_project(self, project: Project):
+        """Switch to a different project."""
+        # Save current state
+        if self.current_project:
+            self._save_current_state()
+
+        # Set new project
+        self.current_project = project
+
+        # Switch database
+        if project.database_path:
+            self.db = FaceDatabase(project.database_path)
+        else:
+            self.db = FaceDatabase()
+
+        # Apply project settings
+        if project.settings:
+            self.detection_threshold = project.settings.detection_threshold
+            self.distance_threshold = project.settings.distance_threshold
+            self.recognition_model = project.settings.model_name
+            self.model_selector.setCurrentText(self.recognition_model)
+
+        # Update profile manager with project settings
+        self.profile_manager = FaceProfileManager(
+            distance_threshold=self.distance_threshold,
+            model_name=self.recognition_model,
+            use_cosine=project.settings.use_cosine if project.settings else True,
+            max_people=project.max_people
+        )
+
+        # Clear and reload data
+        self.gallery.clear()
+        self.images.clear()
+        self.analysis_cache.clear()
         self.load_from_database()
+
+        # Update UI
+        self._update_project_ui()
+
+        self.status_bar.showMessage(f"Switched to project: {project.name}", 3000)
+
+    def _save_current_state(self):
+        """Save current application state to database."""
+        # This is called when switching or closing projects
+        # Database changes are already saved incrementally, so this is mostly a placeholder
+        # for any future session state we might want to persist
+        pass
 
     def load_from_database(self):
         """Load profiles and images from database on startup."""
@@ -2372,13 +2769,14 @@ class MainWindow(QMainWindow):
             for idx, (occurrence, det) in enumerate(zip(occurrences, detections)):
                 if occurrence and det:
                     score = det.get("score", 0.0)
+                    emb = occurrence.get_embedding()
                     self.db.save_detection(
                         image_id=image_id,
-                        profile_id=occurrence.embedding is not None and profile_ids[idx] or None,
+                        profile_id=emb is not None and profile_ids[idx] or None,
                         detection_index=idx,
                         box=occurrence.box,
                         score=score,
-                        embedding=occurrence.embedding,
+                        embedding=emb,
                         face_image=occurrence.face_image
                     )
 
@@ -2740,8 +3138,22 @@ class MainWindow(QMainWindow):
         labels = self._get_labels_for_profile_ids(profile_ids) if profile_ids else []
         if len(labels) < len(detections):
             labels.extend([""] * (len(detections) - len(labels)))
+
+        # OPTIMIZATION: Skip redrawing if annotated image already exists and is valid
+        # This eliminates redundant work when loading from database
+        existing_annotated = entry.get("annotated")
+        if existing_annotated is not None and isinstance(existing_annotated, np.ndarray):
+            # Check if we need to redraw (i.e., if labels might have changed)
+            # We store the last used labels in the entry to detect changes
+            last_labels = entry.get("_last_labels")
+            if last_labels == labels:
+                # Labels haven't changed, use existing annotated image
+                return existing_annotated, color_ids, labels
+
+        # Draw new annotated image
         annotated = draw_face_boxes(original.copy(), detections, color_ids, labels=labels)
         entry["annotated"] = annotated
+        entry["_last_labels"] = labels  # Cache labels for next comparison
         return annotated, color_ids, labels
 
     def _redraw_current_image(self):

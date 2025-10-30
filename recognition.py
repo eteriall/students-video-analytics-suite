@@ -371,6 +371,31 @@ class FaceOccurrence:
     box: Tuple[int, int, int, int]
     embedding: np.ndarray = field(repr=False)
     face_image: np.ndarray = field(repr=False, default_factory=lambda: np.empty(0))
+    # Optional fields for lazy loading
+    detection_id: Optional[int] = field(default=None, repr=False)
+    embedding_blob: Optional[bytes] = field(default=None, repr=False)
+
+    def get_embedding(self):
+        """
+        Get embedding, loading lazily from blob if needed.
+
+        Returns:
+            Embedding numpy array
+        """
+        # If embedding is already loaded, return it
+        if self.embedding is not None and (isinstance(self.embedding, np.ndarray) and self.embedding.size > 0):
+            return self.embedding
+
+        # Try to load from blob if available
+        if self.embedding_blob is not None:
+            import pickle
+            self.embedding = pickle.loads(self.embedding_blob)
+            # Clear blob to free memory after deserialization
+            self.embedding_blob = None
+            return self.embedding
+
+        # No embedding available
+        return None
 
 
 @dataclass
@@ -392,11 +417,14 @@ class FaceProfile:
                 return
 
         self.occurrences.append(occurrence)
-        emb = occurrence.embedding.astype(np.float32)
-        if self.embedding_sum.size == 0:
-            self.embedding_sum = emb.copy()
-        else:
-            self.embedding_sum += emb
+        # Get embedding (lazy load if needed)
+        emb = occurrence.get_embedding()
+        if emb is not None:
+            emb = emb.astype(np.float32)
+            if self.embedding_sum.size == 0:
+                self.embedding_sum = emb.copy()
+            else:
+                self.embedding_sum += emb
         self.occurrence_count += 1
         # Always use the last (most recent) occurrence as representative face
         if occurrence.face_image is not None and occurrence.face_image.size > 0:
@@ -429,7 +457,7 @@ class FaceProfile:
             self.representative_face = None
             self.representative_area = 0
             return True
-        self.embedding_sum = np.sum([occ.embedding for occ in remaining], axis=0).astype(np.float32)
+        self.embedding_sum = np.sum([occ.get_embedding() for occ in remaining if occ.get_embedding() is not None], axis=0).astype(np.float32)
         self.occurrence_count = len(remaining)
         # Use the last (most recent) occurrence as representative face
         if remaining:
@@ -449,7 +477,8 @@ class FaceProfileManager:
         self,
         distance_threshold: float = 0.4,
         model_name: str = "Facenet512",
-        use_cosine: bool = True
+        use_cosine: bool = True,
+        max_people: Optional[int] = None
     ):
         """
         Initialize FaceProfileManager with improved matching.
@@ -460,10 +489,12 @@ class FaceProfileManager:
                 - For L2 distance: depends on embedding dimension
             model_name: DeepFace model to use for embeddings
             use_cosine: Use cosine distance (True) or L2 distance (False)
+            max_people: Maximum number of people/profiles allowed (None = unlimited)
         """
         self.distance_threshold = distance_threshold
         self.model_name = model_name
         self.use_cosine = use_cosine
+        self.max_people = max_people
         self._profiles: Dict[int, FaceProfile] = {}
         self._next_profile_id = 1
         # Cache for normalized embeddings to speed up matching
@@ -534,16 +565,37 @@ class FaceProfileManager:
         return best_id, float(best_dist)
 
     def assign_profile(self, occurrence: FaceOccurrence) -> FaceProfile:
-        emb = occurrence.embedding
+        # Get embedding (lazy load if needed)
+        emb = occurrence.get_embedding()
         match_id, dist = self._find_best_match(emb)
 
+        # Check if we've reached max_people limit
+        current_profile_count = len(self._profiles)
+        max_reached = self.max_people is not None and current_profile_count >= self.max_people
+
         if match_id is None or dist > self.distance_threshold:
-            profile = self._create_profile()
+            if max_reached:
+                # Max people reached - force assignment to best existing profile
+                # even if distance is above threshold
+                if match_id is not None:
+                    # Assign to the best match we found
+                    profile = self._profiles[match_id]
+                elif self._profiles:
+                    # No match at all, assign to first available profile
+                    profile = next(iter(self._profiles.values()))
+                else:
+                    # Edge case: no profiles exist yet but max_people is 0 or 1
+                    profile = self._create_profile()
+            else:
+                # Under limit - create new profile
+                profile = self._create_profile()
         else:
+            # Good match found
             profile = self._profiles[match_id]
-            # Invalidate cache for this profile since it's being updated
-            if match_id in self._embedding_cache:
-                del self._embedding_cache[match_id]
+
+        # Invalidate cache for this profile since it's being updated
+        if profile.profile_id in self._embedding_cache:
+            del self._embedding_cache[profile.profile_id]
 
         profile.add_occurrence(occurrence)
         return profile

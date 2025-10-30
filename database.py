@@ -157,8 +157,18 @@ class FaceDatabase:
               score, embedding_blob, face_blob))
         self.conn.commit()
 
-    def get_detections_for_image(self, image_id: int) -> List[Dict]:
-        """Get all detections for an image."""
+    def get_detections_for_image(self, image_id: int, load_embeddings: bool = False, load_face_images: bool = False) -> List[Dict]:
+        """
+        Get all detections for an image with optional lazy loading.
+
+        Args:
+            image_id: ID of the image
+            load_embeddings: If True, deserialize embeddings (default False for performance)
+            load_face_images: If True, deserialize face images (default False for performance)
+
+        Returns:
+            List of detection dictionaries. Embeddings and face_images will be None unless explicitly loaded.
+        """
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT * FROM detections WHERE image_id = ?
@@ -168,14 +178,39 @@ class FaceDatabase:
         detections = []
         for row in cursor.fetchall():
             det = dict(row)
-            # Deserialize embedding
-            if det['embedding']:
+            # Keep blob data for lazy loading, but don't deserialize by default
+            if load_embeddings and det['embedding']:
                 det['embedding'] = pickle.loads(det['embedding'])
-            # Deserialize face image
-            if det['face_image']:
+            elif not load_embeddings:
+                # Keep the blob reference for later lazy loading
+                det['embedding_blob'] = det['embedding']
+                det['embedding'] = None
+
+            if load_face_images and det['face_image']:
                 det['face_image'] = pickle.loads(det['face_image'])
+            else:
+                # Don't load face images - we'll crop from main image instead
+                det['face_image'] = None
+
             detections.append(det)
         return detections
+
+    def get_embedding(self, detection_id: int) -> Optional[np.ndarray]:
+        """
+        Get embedding for a specific detection (lazy loading).
+
+        Args:
+            detection_id: ID of the detection
+
+        Returns:
+            Deserialized embedding numpy array or None
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT embedding FROM detections WHERE id = ?', (detection_id,))
+        row = cursor.fetchone()
+        if row and row['embedding']:
+            return pickle.loads(row['embedding'])
+        return None
 
     def get_detections_for_profile(self, profile_id: int) -> List[Dict]:
         """Get all detections for a profile (all occurrences of a person)."""
