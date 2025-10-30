@@ -48,6 +48,8 @@ from utils import cv_to_qpixmap
 from database import FaceDatabase
 from projects import ProjectManager, Project, ProjectSettings
 from project_dialogs import ProjectDialog, ProjectSelectionDialog, CampusCredentialsDialog
+from quality_review_dialog import QualityReviewDialog
+from histogram_dialog import FaceCountHistogramDialog
 
 
 class LoadingSpinner(QLabel):
@@ -1105,7 +1107,7 @@ class ProfilePanel(QWidget):
         else:
             return profiles
 
-    def set_profiles(self, profiles):
+    def set_profiles(self, profiles, blur_faces=False):
         # Store all profiles for sorting
         self._all_profiles = list(profiles)
 
@@ -1129,6 +1131,13 @@ class ProfilePanel(QWidget):
             item.setData(Qt.UserRole, profile.profile_id)
             face_img = profile.representative_face
             if face_img is not None and getattr(face_img, "size", 0):
+                # Apply blur if requested
+                if blur_faces:
+                    fh, fw = face_img.shape[:2]
+                    k = max(45, int(max(fh, fw) / 4))
+                    if k % 2 == 0:
+                        k += 1
+                    face_img = cv2.GaussianBlur(face_img, (k, k), 0)
                 pm = cv_to_qpixmap(face_img)
                 item.setIcon(QIcon(pm))
             self.profile_list.addItem(item)
@@ -2193,6 +2202,23 @@ class MainWindow(QMainWindow):
         self.edit_project_action.setEnabled(False)
         self.close_project_action.setEnabled(False)
 
+        # Tools menu
+        tools_menu = menubar.addMenu("&Tools")
+
+        quality_review_action = QAction("&Quality Review...", self)
+        quality_review_action.setShortcut("Ctrl+Q")
+        quality_review_action.triggered.connect(self._on_quality_review)
+        tools_menu.addAction(quality_review_action)
+        self.quality_review_action = quality_review_action
+        self.quality_review_action.setEnabled(False)
+
+        histogram_action = QAction("Face Count &Histogram...", self)
+        histogram_action.setShortcut("Ctrl+H")
+        histogram_action.triggered.connect(self._on_show_histogram)
+        tools_menu.addAction(histogram_action)
+        self.histogram_action = histogram_action
+        self.histogram_action.setEnabled(False)
+
     def _update_project_ui(self):
         """Update UI to reflect current project state."""
         if self.current_project:
@@ -2203,11 +2229,15 @@ class MainWindow(QMainWindow):
             # Enable project actions
             self.edit_project_action.setEnabled(True)
             self.close_project_action.setEnabled(True)
+            self.quality_review_action.setEnabled(True)
+            self.histogram_action.setEnabled(True)
         else:
             self.setWindowTitle("Face Gallery")
             self.project_label.setText("No project")
             self.edit_project_action.setEnabled(False)
             self.close_project_action.setEnabled(False)
+            self.quality_review_action.setEnabled(False)
+            self.histogram_action.setEnabled(False)
 
     def _on_new_project(self):
         """Create a new project."""
@@ -2323,6 +2353,91 @@ class MainWindow(QMainWindow):
                     self.project_manager.delete_project(project.id)
                     QMessageBox.information(self, "Success", f"Project '{project.name}' deleted.")
 
+    def _on_quality_review(self):
+        """Open quality review dialog."""
+        if not self.current_project or not self.db:
+            QMessageBox.warning(self, "No Project", "Please open a project first.")
+            return
+
+        dialog = QualityReviewDialog(self.db, parent=self)
+        dialog.qualityImproved.connect(self._on_quality_improved)
+        dialog.exec_()
+
+    def _on_show_histogram(self):
+        """Open face count histogram dialog."""
+        if not self.current_project or not self.db:
+            QMessageBox.warning(self, "No Project", "Please open a project first.")
+            return
+
+        dialog = FaceCountHistogramDialog(self.db, parent=self)
+        dialog.exec_()
+
+    def _on_quality_improved(self):
+        """Handle signal when quality improvements are made."""
+        print("Reloading profiles after quality improvements...")
+
+        # Clear and reload profiles from database
+        self.profile_manager._profiles.clear()
+
+        # Reload profiles with all their occurrences
+        profiles_data = self.db.get_all_profiles()
+        if profiles_data:
+            # Check if max_people limit would be exceeded
+            total_profiles = len(profiles_data)
+            max_people = self.profile_manager.max_people
+
+            if max_people is not None and total_profiles > max_people:
+                print(f"WARNING: Database contains {total_profiles} profiles but max_people is set to {max_people}")
+                profiles_data = profiles_data[:max_people]
+
+            # Update next_profile_id to avoid conflicts
+            max_id = max(p['id'] for p in profiles_data) if profiles_data else 0
+            self.profile_manager._next_profile_id = max_id + 1
+
+            # Reconstruct profiles with their occurrences
+            from recognition import FaceProfile, FaceOccurrence
+            for prof_data in profiles_data:
+                profile_id = prof_data['id']
+                label = prof_data['label']
+
+                # Get all detections for this profile
+                detections_data = self.db.get_detections_for_profile(profile_id)
+
+                if detections_data:
+                    # Create profile object
+                    profile = FaceProfile(profile_id=profile_id, label=label)
+
+                    # Add all occurrences to the profile
+                    for det_data in detections_data:
+                        # Reconstruct FaceOccurrence
+                        occurrence = FaceOccurrence(
+                            image_path=det_data['image_path'],
+                            detection_index=det_data['detection_index'],
+                            box=(det_data['box_x'], det_data['box_y'], det_data['box_w'], det_data['box_h']),
+                            embedding=det_data['embedding'],
+                            face_image=det_data.get('face_image')
+                        )
+                        profile.add_occurrence(occurrence)
+
+                    # Add profile to manager
+                    self.profile_manager._profiles[profile_id] = profile
+
+        print(f"Reloaded {len(self.profile_manager._profiles)} profiles")
+
+        # Refresh the profile panel to show updated profiles
+        self.profile_panel.set_profiles(self.profile_manager.profiles())
+
+        # Clear cache for current image and reload it
+        if self.current_image_path:
+            # Remove from cache to force reload from database
+            if self.current_image_path in self.analysis_cache:
+                del self.analysis_cache[self.current_image_path]
+
+            # Reload the current image
+            current_row = self.gallery.currentRow()
+            if current_row >= 0:
+                self.on_select(current_row)
+
     def _switch_to_project(self, project: Project):
         """Switch to a different project."""
         # Save current state
@@ -2378,6 +2493,15 @@ class MainWindow(QMainWindow):
         # Load profiles with all their occurrences
         profiles_data = self.db.get_all_profiles()
         if profiles_data:
+            # Check if max_people limit would be exceeded
+            total_profiles = len(profiles_data)
+            max_people = self.profile_manager.max_people
+
+            if max_people is not None and total_profiles > max_people:
+                print(f"WARNING: Database contains {total_profiles} profiles but max_people is set to {max_people}")
+                print(f"Only loading first {max_people} profiles to respect the limit")
+                profiles_data = profiles_data[:max_people]
+
             print(f"Loading {len(profiles_data)} profiles from database")
             # Update next_profile_id to avoid conflicts
             max_id = max(p['id'] for p in profiles_data) if profiles_data else 0
@@ -2441,11 +2565,96 @@ class MainWindow(QMainWindow):
 
 
     def add_images(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select images", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        if not files:
+        """Import images - either individual files or from a directory"""
+        # Ask user what they want to import
+        reply = QMessageBox.question(
+            self,
+            "Import Images",
+            "What would you like to import?",
+            QMessageBox.StandardButton(
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+            ),
+            QMessageBox.Yes
+        )
+
+        # Customize button text
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Import Images")
+        msg_box.setText("What would you like to import?")
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+
+        # Get buttons and change their text
+        yes_btn = msg_box.button(QMessageBox.Yes)
+        yes_btn.setText("Select Files")
+        no_btn = msg_box.button(QMessageBox.No)
+        no_btn.setText("Select Folder")
+        cancel_btn = msg_box.button(QMessageBox.Cancel)
+        cancel_btn.setText("Cancel")
+
+        result = msg_box.exec_()
+
+        files_to_import = []
+
+        if result == QMessageBox.Yes:
+            # Select individual files
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select images",
+                "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+            )
+            files_to_import = files
+
+        elif result == QMessageBox.No:
+            # Select directory
+            directory = QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder",
+                "",
+                QFileDialog.ShowDirsOnly
+            )
+
+            if directory:
+                # Recursively find all image files
+                image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.PNG', '.JPG', '.JPEG', '.BMP', '.GIF'}
+                dir_path = Path(directory)
+
+                for ext in image_extensions:
+                    # Use rglob for recursive search
+                    files_to_import.extend(str(p) for p in dir_path.rglob(f'*{ext}'))
+
+                if not files_to_import:
+                    QMessageBox.information(
+                        self,
+                        "No Images Found",
+                        f"No image files found in:\n{directory}"
+                    )
+                    return
+
+                # Show how many images were found
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Import",
+                    f"Found {len(files_to_import)} image(s) in the folder.\n\nProceed with import?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+
+                if reply != QMessageBox.Yes:
+                    return
+        else:
+            # Cancel
             return
+
+        if not files_to_import:
+            return
+
+        # Import the files
         added = 0
-        for fpath in files:
+        skipped = 0
+        errors = 0
+
+        for fpath in files_to_import:
             source_path = Path(fpath)
             if not source_path.is_file():
                 continue
@@ -2453,11 +2662,13 @@ class MainWindow(QMainWindow):
             try:
                 local_path = self._store_image_locally(source_path)
             except OSError as exc:
-                QMessageBox.warning(self, "Import Error", f"Could not import {source_path.name}:\n{exc}")
+                print(f"Could not import {source_path.name}: {exc}")
+                errors += 1
                 continue
 
             local_path_str = str(local_path)
             if local_path_str in self.images:
+                skipped += 1
                 continue
 
             # Add to database
@@ -2466,6 +2677,16 @@ class MainWindow(QMainWindow):
 
             if self._add_image_to_gallery(local_path_str):
                 added += 1
+
+        # Show summary
+        summary = f"Import complete:\n\n"
+        summary += f"✓ Added: {added} image(s)\n"
+        if skipped > 0:
+            summary += f"⊗ Skipped (already imported): {skipped}\n"
+        if errors > 0:
+            summary += f"✗ Errors: {errors}\n"
+
+        QMessageBox.information(self, "Import Summary", summary)
 
         if added and self.gallery.currentRow() < 0:
             self.gallery.setCurrentRow(0)
@@ -3265,6 +3486,8 @@ class MainWindow(QMainWindow):
             self.current_faces = [face.copy() for face in self.current_blurred_faces]
             self.is_blurred = True
             self.blur_btn.setText("Unblur Faces")
+            # Also blur profile panel faces
+            self.profile_panel.set_profiles(self.profile_manager.profiles(), blur_faces=True)
         else:
             annotated = self.current_annotated_image
             if annotated is None and self.current_image_original is not None:
@@ -3278,6 +3501,8 @@ class MainWindow(QMainWindow):
             self.current_faces = [face.copy() for face in self.current_faces_original]
             self.is_blurred = False
             self.blur_btn.setText("Blur Faces")
+            # Also unblur profile panel faces
+            self.profile_panel.set_profiles(self.profile_manager.profiles(), blur_faces=False)
 
     def on_face_double_clicked(self, profile_id):
         """Handle double-click on face thumbnail - select the profile"""
