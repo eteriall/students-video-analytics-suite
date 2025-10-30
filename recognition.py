@@ -584,8 +584,13 @@ class FaceProfileManager:
                     # No match at all, assign to first available profile
                     profile = next(iter(self._profiles.values()))
                 else:
-                    # Edge case: no profiles exist yet but max_people is 0 or 1
-                    profile = self._create_profile()
+                    # Edge case: no profiles exist yet AND we're at limit
+                    # Only create profile if limit allows at least one
+                    if self.max_people is None or self.max_people > 0:
+                        profile = self._create_profile()
+                    else:
+                        # max_people is 0, cannot create any profiles
+                        raise ValueError("Cannot create profile: max_people limit is 0")
             else:
                 # Under limit - create new profile
                 profile = self._create_profile()
