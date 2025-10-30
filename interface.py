@@ -96,21 +96,26 @@ class DatabaseLoadWorker(QThread):
     finished = pyqtSignal(str, object)  # path, cache_entry
     error = pyqtSignal(str, str)  # path, error_message
 
-    def __init__(self, path, image_id, mtime, db, profile_manager, parent=None):
+    def __init__(self, path, image_id, mtime, db_path, profile_manager, parent=None):
         super().__init__(parent)
         self.path = path
         self.image_id = image_id
         self.mtime = mtime
-        self.db = db
+        self.db_path = db_path
         self.profile_manager = profile_manager
 
     def run(self):
+        db = None
         try:
             from recognition import FaceOccurrence, cluster_detections, draw_face_boxes, normalize_face
 
+            # Create a new database connection in this thread
+            # SQLite connections cannot be shared across threads
+            db = FaceDatabase(self.db_path)
+
             # Get detections from database WITHOUT loading embeddings or face images
             # This significantly speeds up loading by skipping pickle deserialization
-            detections_data = self.db.get_detections_for_image(
+            detections_data = db.get_detections_for_image(
                 self.image_id,
                 load_embeddings=False,  # Skip embedding deserialization - not needed for display
                 load_face_images=False  # Skip face image deserialization - crop from main image instead
@@ -199,6 +204,10 @@ class DatabaseLoadWorker(QThread):
         except Exception as e:
             import traceback
             self.error.emit(self.path, f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            # Always close the database connection
+            if db is not None:
+                db.close()
 
 
 class ImageProcessWorker(QThread):
@@ -1237,13 +1246,27 @@ class ProfilePanel(QWidget):
 
         new_name = edit.text().strip()
 
+        # Store the old text before clearing widget
+        try:
+            old_text = item.text()
+        except RuntimeError:
+            # Item has been deleted, just clean up
+            self._editing_item = None
+            self._edit_widget = None
+            return
+
         # Remove widget
-        self.profile_list.setItemWidget(item, None)
+        try:
+            self.profile_list.setItemWidget(item, None)
+        except RuntimeError:
+            # Item has been deleted, just clean up
+            pass
+
         self._editing_item = None
         self._edit_widget = None
 
         # Only emit if name changed and not empty
-        if new_name and new_name != item.text():
+        if new_name and new_name != old_text:
             self.profileRenamed.emit(profile_id, new_name)
 
     def get_all_profile_names(self):
@@ -2823,7 +2846,7 @@ class MainWindow(QMainWindow):
                 self.current_worker.wait()
 
             # Start database load worker
-            self.current_worker = DatabaseLoadWorker(path, image_id, mtime, self.db, self.profile_manager, self)
+            self.current_worker = DatabaseLoadWorker(path, image_id, mtime, self.db.db_path, self.profile_manager, self)
             self.current_worker.finished.connect(self._on_database_loaded)
             self.current_worker.error.connect(self._on_database_load_error)
             self.current_worker.start()

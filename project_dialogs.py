@@ -151,15 +151,16 @@ class ProjectDialog(QDialog):
         layout.addSpacing(10)
 
         # Create form layout for basic fields
-        form_layout = QFormLayout()
+        self.form_layout = QFormLayout()
 
         # Project name (always visible)
+        self.name_label = QLabel("Project Name:*")
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("e.g., Summer Camp 2024")
-        self.name_row = form_layout.rowCount()
-        form_layout.addRow("Project Name:*", self.name_edit)
+        self.form_layout.addRow(self.name_label, self.name_edit)
 
         # Dates (hidden when fetch_from_campus is checked)
+        self.dates_label = QLabel("Dates:")
         date_layout = QHBoxLayout()
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
@@ -174,26 +175,25 @@ class ProjectDialog(QDialog):
         date_layout.addStretch()
         self.dates_widget = QWidget()
         self.dates_widget.setLayout(date_layout)
-        self.dates_row = form_layout.rowCount()
-        form_layout.addRow("Dates:", self.dates_widget)
+        self.form_layout.addRow(self.dates_label, self.dates_widget)
 
         # Location (hidden when fetch_from_campus is checked)
+        self.location_label = QLabel("Location:")
         self.location_edit = QLineEdit()
         self.location_edit.setPlaceholderText("e.g., New York, USA")
-        self.location_row = form_layout.rowCount()
-        form_layout.addRow("Location:", self.location_edit)
+        self.form_layout.addRow(self.location_label, self.location_edit)
 
         # Max people (only shown when fetch_from_campus is NOT checked)
+        self.max_people_label = QLabel("Maximum People:")
         self.max_people_spin = QSpinBox()
         self.max_people_spin.setMinimum(1)
         self.max_people_spin.setMaximum(10000)
         self.max_people_spin.setValue(50)
         self.max_people_spin.setSpecialValueText("Unlimited")
         self.max_people_spin.setPrefix("")
-        self.max_people_row = form_layout.rowCount()
-        form_layout.addRow("Maximum People:", self.max_people_spin)
+        self.form_layout.addRow(self.max_people_label, self.max_people_spin)
 
-        layout.addLayout(form_layout)
+        layout.addLayout(self.form_layout)
 
         # CAMPUS Integration Group (shown only when fetch_from_campus is checked)
         self.campus_group = QGroupBox("CAMPUS Platform Integration")
@@ -275,28 +275,19 @@ class ProjectDialog(QDialog):
         # - Show: name, dates, location, max_people
         # - Hide: CAMPUS integration, participants
 
-        # Toggle basic fields
+        # Toggle basic fields (hide when CAMPUS mode is ON)
+        self.name_label.setVisible(not is_campus)
         self.name_edit.setVisible(not is_campus)
-        # Also hide the label
-        label_item = self.name_edit.parent().layout().labelForField(self.name_edit)
-        if label_item:
-            label_item.setVisible(not is_campus)
 
+        self.dates_label.setVisible(not is_campus)
         self.dates_widget.setVisible(not is_campus)
-        label_item = self.dates_widget.parent().layout().labelForField(self.dates_widget)
-        if label_item:
-            label_item.setVisible(not is_campus)
 
+        self.location_label.setVisible(not is_campus)
         self.location_edit.setVisible(not is_campus)
-        label_item = self.location_edit.parent().layout().labelForField(self.location_edit)
-        if label_item:
-            label_item.setVisible(not is_campus)
 
         # Max people only shown when NOT fetching from CAMPUS
+        self.max_people_label.setVisible(not is_campus)
         self.max_people_spin.setVisible(not is_campus)
-        label_item = self.max_people_spin.parent().layout().labelForField(self.max_people_spin)
-        if label_item:
-            label_item.setVisible(not is_campus)
 
         # CAMPUS group only shown when fetching from CAMPUS
         self.campus_group.setVisible(is_campus)
