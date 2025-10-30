@@ -62,6 +62,8 @@ class FaceDatabase:
                 score REAL,
                 embedding BLOB,
                 face_image BLOB,
+                emotion TEXT,
+                gaze_direction TEXT,
                 FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE,
                 FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE SET NULL
             )
@@ -76,6 +78,16 @@ class FaceDatabase:
             CREATE INDEX IF NOT EXISTS idx_detections_profile
             ON detections(profile_id)
         ''')
+
+        # Migration: Add emotion and gaze_direction columns if they don't exist
+        cursor.execute("PRAGMA table_info(detections)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if 'emotion' not in columns:
+            cursor.execute('ALTER TABLE detections ADD COLUMN emotion TEXT')
+
+        if 'gaze_direction' not in columns:
+            cursor.execute('ALTER TABLE detections ADD COLUMN gaze_direction TEXT')
 
         self.conn.commit()
 
@@ -136,7 +148,8 @@ class FaceDatabase:
 
     def save_detection(self, image_id: int, profile_id: int, detection_index: int,
                        box: Tuple[int, int, int, int], score: float,
-                       embedding: np.ndarray, face_image: Optional[np.ndarray] = None):
+                       embedding: np.ndarray, face_image: Optional[np.ndarray] = None,
+                       emotion: Optional[str] = None, gaze_direction: Optional[str] = None):
         """Save a face detection with embedding."""
         cursor = self.conn.cursor()
 
@@ -151,10 +164,21 @@ class FaceDatabase:
         cursor.execute('''
             INSERT INTO detections
             (image_id, profile_id, detection_index, box_x, box_y, box_w, box_h,
-             score, embedding, face_image)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             score, embedding, face_image, emotion, gaze_direction)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (image_id, profile_id, detection_index, box_x, box_y, box_w, box_h,
-              score, embedding_blob, face_blob))
+              score, embedding_blob, face_blob, emotion, gaze_direction))
+        self.conn.commit()
+
+    def update_detection_analysis(self, detection_id: int, emotion: Optional[str] = None,
+                                  gaze_direction: Optional[str] = None):
+        """Update emotion and gaze direction for a detection."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE detections
+            SET emotion = ?, gaze_direction = ?
+            WHERE id = ?
+        ''', (emotion, gaze_direction, detection_id))
         self.conn.commit()
 
     def get_detections_for_image(self, image_id: int, load_embeddings: bool = False, load_face_images: bool = False) -> List[Dict]:

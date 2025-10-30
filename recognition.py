@@ -374,6 +374,9 @@ class FaceOccurrence:
     # Optional fields for lazy loading
     detection_id: Optional[int] = field(default=None, repr=False)
     embedding_blob: Optional[bytes] = field(default=None, repr=False)
+    # Emotion and gaze analysis
+    emotion: Optional[str] = field(default=None)
+    gaze_direction: Optional[str] = field(default=None)
 
     def get_embedding(self):
         """
