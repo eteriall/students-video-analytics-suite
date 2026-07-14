@@ -509,15 +509,22 @@ class FaceProfileManager:
     def get_profile(self, profile_id: int) -> Optional[FaceProfile]:
         return self._profiles.get(profile_id)
 
-    def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[int], float]:
+    def _find_best_match(self, embedding: np.ndarray, exclude_profile_ids: set = None) -> Tuple[Optional[int], float]:
         """
         Find the best matching profile for an embedding using optimized distance calculation.
+
+        Args:
+            embedding: The face embedding to match
+            exclude_profile_ids: Optional set of profile IDs to exclude from matching
 
         Returns:
             Tuple of (profile_id, distance) or (None, inf) if no match
         """
         if embedding is None or embedding.size == 0:
             return None, float("inf")
+
+        if exclude_profile_ids is None:
+            exclude_profile_ids = set()
 
         best_id = None
         best_dist = float("inf")
@@ -528,6 +535,10 @@ class FaceProfileManager:
             embeddings = []
 
             for pid, profile in self._profiles.items():
+                # Skip excluded profiles
+                if pid in exclude_profile_ids:
+                    continue
+
                 # Use cached normalized embedding if available
                 if pid not in self._embedding_cache:
                     avg_emb = profile.average_embedding()
@@ -567,10 +578,21 @@ class FaceProfileManager:
 
         return best_id, float(best_dist)
 
-    def assign_profile(self, occurrence: FaceOccurrence) -> FaceProfile:
+    def assign_profile(self, occurrence: FaceOccurrence, exclude_profile_ids: set = None) -> FaceProfile:
+        """
+        Assign a profile to a face occurrence, optionally excluding certain profiles.
+
+        Args:
+            occurrence: The face occurrence to assign
+            exclude_profile_ids: Optional set of profile IDs to exclude from matching
+                                (used to prevent duplicate profiles in same image)
+
+        Returns:
+            The assigned FaceProfile
+        """
         # Get embedding (lazy load if needed)
         emb = occurrence.get_embedding()
-        match_id, dist = self._find_best_match(emb)
+        match_id, dist = self._find_best_match(emb, exclude_profile_ids)
 
         # Check if we've reached max_people limit
         current_profile_count = len(self._profiles)
@@ -620,7 +642,18 @@ class FaceProfileManager:
         self._next_profile_id = 1
         self._embedding_cache.clear()
 
-    def remove_image_occurrences(self, image_path: str) -> bool:
+    def remove_image_occurrences(self, image_path: str) -> tuple[bool, list[int]]:
+        """
+        Remove all occurrences of an image from all profiles.
+
+        Args:
+            image_path: Path to the image to remove
+
+        Returns:
+            Tuple of (changed, empty_profile_ids) where:
+            - changed: True if any occurrences were removed
+            - empty_profile_ids: List of profile IDs that became empty and were deleted
+        """
         changed = False
         empty_profiles = []
         for pid, profile in self._profiles.items():
@@ -635,7 +668,7 @@ class FaceProfileManager:
             del self._profiles[pid]
             if pid in self._embedding_cache:
                 del self._embedding_cache[pid]
-        return changed
+        return changed, empty_profiles
 
     def rename_profile(self, profile_id: int, new_label: str) -> bool:
         """

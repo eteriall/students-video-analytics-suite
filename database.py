@@ -19,9 +19,17 @@ class FaceDatabase:
     def __init__(self, db_path: str = "face_recognition.db"):
         """Initialize database connection and create tables if needed."""
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+
+        # Enable WAL mode for better concurrency and performance
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+
         self.create_tables()
+        self._in_transaction = False
 
     def create_tables(self):
         """Create database tables if they don't exist."""
@@ -295,12 +303,89 @@ class FaceDatabase:
         max_id = row['max_id'] if row['max_id'] is not None else 0
         return max_id + 1
 
+    def begin_transaction(self):
+        """Begin a transaction for batch operations."""
+        if not self._in_transaction:
+            self.conn.execute("BEGIN TRANSACTION")
+            self._in_transaction = True
+
+    def commit_transaction(self):
+        """Commit the current transaction."""
+        if self._in_transaction:
+            self.conn.commit()
+            self._in_transaction = False
+
+    def rollback_transaction(self):
+        """Rollback the current transaction."""
+        if self._in_transaction:
+            self.conn.rollback()
+            self._in_transaction = False
+
+    def save_detection_batch(self, detections_data: List[Dict]):
+        """
+        Save multiple detections in a single transaction for better performance.
+
+        Args:
+            detections_data: List of dicts with keys: image_id, profile_id, detection_index,
+                            box, score, embedding, face_image (optional), emotion, gaze_direction
+        """
+        if not detections_data:
+            return
+
+        cursor = self.conn.cursor()
+
+        for data in detections_data:
+            # Serialize embedding
+            embedding_blob = pickle.dumps(data['embedding'])
+
+            # Serialize face image if provided (will be removed in next optimization)
+            face_blob = pickle.dumps(data.get('face_image')) if data.get('face_image') is not None else None
+
+            box_x, box_y, box_w, box_h = data['box']
+
+            cursor.execute('''
+                INSERT INTO detections
+                (image_id, profile_id, detection_index, box_x, box_y, box_w, box_h,
+                 score, embedding, face_image, emotion, gaze_direction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (data['image_id'], data['profile_id'], data['detection_index'],
+                  box_x, box_y, box_w, box_h, data.get('score', 0.0),
+                  embedding_blob, face_blob, data.get('emotion'), data.get('gaze_direction')))
+
+        # Only commit if not in a larger transaction
+        if not self._in_transaction:
+            self.conn.commit()
+
+    def save_profiles_batch(self, profiles_data: List[Tuple[int, str]]):
+        """
+        Save multiple profiles in a single transaction.
+
+        Args:
+            profiles_data: List of tuples (profile_id, label)
+        """
+        if not profiles_data:
+            return
+
+        cursor = self.conn.cursor()
+        cursor.executemany('''
+            INSERT OR REPLACE INTO profiles (id, label, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', profiles_data)
+
+        # Only commit if not in a larger transaction
+        if not self._in_transaction:
+            self.conn.commit()
+
     def close(self):
         """Close database connection."""
+        if self._in_transaction:
+            self.commit_transaction()
         self.conn.close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None and self._in_transaction:
+            self.rollback_transaction()
         self.close()

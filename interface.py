@@ -1,7 +1,9 @@
 import os
 import shutil
 import uuid
+import gc
 from pathlib import Path
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -25,6 +27,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QCompleter,
     QProgressBar,
+    QProgressDialog,
     QApplication,
     QSplashScreen,
     QStackedLayout,
@@ -211,6 +214,8 @@ class DatabaseLoadWorker(QThread):
             # Always close the database connection
             if db is not None:
                 db.close()
+            # Clean up to prevent memory leaks
+            gc.collect()
 
 
 class ImageProcessWorker(QThread):
@@ -264,6 +269,9 @@ class ImageProcessWorker(QThread):
         except Exception as e:
             import traceback
             self.error.emit(self.image_path, f"{str(e)}\n{traceback.format_exc()}")
+        finally:
+            # Clean up to prevent memory leaks
+            gc.collect()
 
 
 class BatchProcessWorker(QThread):
@@ -281,6 +289,7 @@ class BatchProcessWorker(QThread):
 
     def run(self):
         """Process all images in background thread"""
+        import gc
         processed_count = 0
 
         for i, image_path in enumerate(self.image_paths):
@@ -323,15 +332,28 @@ class BatchProcessWorker(QThread):
                 self.image_finished.emit(image_path, result)
                 processed_count += 1
 
+                # Clean up to prevent memory accumulation
+                del img
+                del faces
+                del detections
+
+                # Periodic garbage collection (every 10 images)
+                if (i + 1) % 10 == 0:
+                    gc.collect()
+
             except Exception as e:
                 import traceback
                 self.error.emit(image_path, f"{str(e)}\n{traceback.format_exc()}")
 
+        # Final cleanup
+        gc.collect()
         self.all_finished.emit(processed_count, len(self.image_paths))
 
 
 class ZoomableImageView(QWidget):
     hoverFaceChanged = pyqtSignal(int)
+    boxDoubleClicked = pyqtSignal(int)  # Emit face index when box is double-clicked
+    labelDoubleClicked = pyqtSignal(int)  # Emit face index when label is double-clicked
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -351,13 +373,15 @@ class ZoomableImageView(QWidget):
         self.grabGesture(Qt.PanGesture)
         self._detections = []
         self._clusters = []
+        self._labels = []  # Store labels for click detection
         self._highlight_index = -1
         self._external_highlight = -1
         self._external_highlight_active = False
 
-    def set_detections(self, detections, clusters=None):
+    def set_detections(self, detections, clusters=None, labels=None):
         self._detections = detections or []
         self._clusters = list(clusters) if clusters is not None else [0] * len(self._detections)
+        self._labels = list(labels) if labels is not None else []
         self._highlight_index = -1
         self._external_highlight = -1
         self._external_highlight_active = False
@@ -440,8 +464,79 @@ class ZoomableImageView(QWidget):
         else:
             super().mouseReleaseEvent(event)
 
+    def _get_label_rect(self, det_idx):
+        """
+        Calculate the label rectangle for a detection based on draw_face_boxes logic.
+        Returns (x1, y1, x2, y2) in image coordinates or None if no label.
+        """
+        if det_idx < 0 or det_idx >= len(self._detections):
+            return None
+        if det_idx >= len(self._labels) or not self._labels[det_idx]:
+            return None
+
+        det = self._detections[det_idx]
+        box = det.get("box")
+        if not box or len(box) != 4:
+            return None
+
+        x, y, w, h = box
+        label_text = self._labels[det_idx]
+
+        # Use same logic as draw_face_boxes in recognition.py
+        # Scale is 1.0 for original image coordinates
+        scale = 1.0
+        x0 = int(round(x * scale))
+        y0 = int(round(y * scale))
+        x1 = int(round((x + w) * scale))
+        y1 = int(round((y + h) * scale))
+
+        # Calculate text size (approximate - using simplified version)
+        # These are rough estimates based on draw_face_boxes parameters
+        font_scale = max(1.2, 1.5 * scale if scale > 0.5 else 1.2)
+        # Approximate character width and height
+        char_width = 15 * font_scale
+        char_height = 25 * font_scale
+        text_width = int(len(label_text) * char_width)
+        text_height = int(char_height)
+        baseline = int(5 * font_scale)
+
+        padding = 6
+        bg_x1 = x0 - padding // 2
+        bg_y1 = y1 + 4
+        bg_x2 = x0 + text_width + padding
+        bg_y2 = y1 + text_height + 10 + baseline + padding
+
+        return (bg_x1, bg_y1, bg_x2, bg_y2)
+
     def mouseDoubleClickEvent(self, event):
-        if not self._pixmap.isNull():
+        if not self._pixmap.isNull() and self._detections:
+            # Convert click position to image coordinates
+            pos = event.pos()
+            img_x = (pos.x() - self._offset.x()) / self._scale
+            img_y = (pos.y() - self._offset.y()) / self._scale
+
+            # Check if click is on a label first (labels are on top visually)
+            for idx, det in enumerate(self._detections):
+                label_rect = self._get_label_rect(idx)
+                if label_rect:
+                    lx1, ly1, lx2, ly2 = label_rect
+                    if lx1 <= img_x <= lx2 and ly1 <= img_y <= ly2:
+                        self.labelDoubleClicked.emit(idx)
+                        event.accept()
+                        return
+
+            # Check if click is on a bounding box
+            for idx, det in enumerate(self._detections):
+                box = det.get("box")
+                if not box or len(box) != 4:
+                    continue
+                x, y, w, h = box
+                if x <= img_x <= x + w and y <= img_y <= y + h:
+                    self.boxDoubleClicked.emit(idx)
+                    event.accept()
+                    return
+
+            # No box or label clicked, fit in view
             self._fit_in_view()
             event.accept()
         else:
@@ -782,8 +877,8 @@ class ZoomableImageView(QWidget):
         self.update()
 
 
-class FacePanel(QWidget):
-    faceDoubleClicked = pyqtSignal(int)  # Emit profile_id when face is double-clicked
+class ImagePanel(QWidget):
+    """Simplified panel for displaying images without face thumbnails"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -833,29 +928,15 @@ class FacePanel(QWidget):
         self.image_container_layout.addWidget(self.image_view)
         self.image_container_layout.addWidget(spinner_container)
 
-        self.faces_container = QWidget()
-        self.faces_layout = QHBoxLayout(self.faces_container)
-        self.faces_layout.setContentsMargins(8, 8, 8, 8)
-        self.faces_layout.setSpacing(8)
-        self.face_widgets = []
-        self.face_labels = []
-        self.face_text_labels = []  # Text labels for names
-        self.face_clusters = []
-        self.face_profile_ids = []  # Store profile IDs
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self.faces_container)
-        self.scroll.setFixedHeight(210)  # Increased to accommodate text
+        # Layout - only status, progress, and image (no face carousel)
         layout = QVBoxLayout(self)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.image_container)
-        layout.addWidget(self.scroll)
 
     def show_loading(self):
         """Show loading spinner overlay"""
         self.loading_spinner.setVisible(True)
-        # Ensure spinner is on top and repaints
         self.loading_spinner.raise_()
         self.loading_spinner.repaint()
         QApplication.processEvents()
@@ -866,111 +947,6 @@ class FacePanel(QWidget):
 
     def show_image(self, pixmap, reset_view=True):
         self.image_view.setPixmap(pixmap, reset_view=reset_view)
-
-    def set_faces(self, faces, clusters=None, labels=None, profile_ids=None):
-        """
-        Set faces to display in the panel.
-
-        Args:
-            faces: List of QPixmap face images
-            clusters: List of cluster IDs for coloring
-            labels: List of person names to display
-            profile_ids: List of profile IDs for clicking
-        """
-        for label in self.face_labels:
-            label.removeEventFilter(self)
-        while self.faces_layout.count():
-            w = self.faces_layout.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        self.face_widgets = []
-        self.face_labels = []
-        self.face_text_labels = []
-        self.face_clusters = list(clusters) if clusters is not None else []
-        self.face_profile_ids = list(profile_ids) if profile_ids is not None else []
-        if len(self.face_clusters) < len(faces):
-            self.face_clusters.extend([0] * (len(faces) - len(self.face_clusters)))
-        if len(self.face_profile_ids) < len(faces):
-            self.face_profile_ids.extend([None] * (len(faces) - len(self.face_profile_ids)))
-
-        face_labels = labels if labels else []
-        if len(face_labels) < len(faces):
-            face_labels.extend([""] * (len(faces) - len(face_labels)))
-
-        for idx, pm in enumerate(faces):
-            container = QWidget()
-            vbox = QVBoxLayout(container)
-            vbox.setContentsMargins(0, 0, 0, 0)
-            vbox.setSpacing(2)
-
-            # Face image
-            img_label = QLabel()
-            img_label.setAlignment(Qt.AlignCenter)
-            img_label.setPixmap(pm.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            img_label.setFixedSize(170, 170)
-            img_label.setProperty("faceIndex", idx)
-            img_label.installEventFilter(self)
-            vbox.addWidget(img_label)
-
-            # Text label for person name
-            text_label = QLabel(face_labels[idx] if idx < len(face_labels) else "")
-            text_label.setAlignment(Qt.AlignCenter)
-            text_label.setWordWrap(True)
-            text_label.setFixedWidth(170)
-            text_label.setStyleSheet("font-size: 11px; padding: 2px;")
-            text_label.setProperty("faceIndex", idx)
-            text_label.installEventFilter(self)
-            vbox.addWidget(text_label)
-
-            self.faces_layout.addWidget(container)
-            self.face_widgets.append(container)
-            self.face_labels.append(img_label)
-            self.face_text_labels.append(text_label)
-        self.faces_layout.addStretch(1)
-        self.highlight_face(-1)
-
-    def highlight_face(self, index, cluster_id=-1):
-        valid_index = index is not None and 0 <= index < len(self.face_widgets)
-        highlight_active = bool(valid_index)
-        for idx, widget in enumerate(self.face_widgets):
-            label = self.face_labels[idx] if idx < len(self.face_labels) else None
-            if highlight_active and idx == index:
-                cid = cluster_id if cluster_id >= 0 else (self.face_clusters[idx] if idx < len(self.face_clusters) else -1)
-                r, g, b = cluster_color(cid)
-                widget.setStyleSheet(
-                    f"border: 4px solid rgb({r}, {g}, {b});"
-                    f"background-color: rgba({r}, {g}, {b}, 40);"
-                )
-                if label:
-                    label.setStyleSheet("background-color: transparent;")
-            elif highlight_active:
-                widget.setStyleSheet("border: 0px solid transparent; background-color: rgba(0, 0, 0, 128);")
-                if label:
-                    label.setStyleSheet("background-color: rgba(0, 0, 0, 128);")
-            else:
-                widget.setStyleSheet("")
-                if label:
-                    label.setStyleSheet("")
-
-    def eventFilter(self, obj, event):
-        if obj in self.face_labels or obj in self.face_text_labels:
-            idx_var = obj.property("faceIndex")
-            idx = int(idx_var) if idx_var is not None else -1
-
-            if event.type() == QEvent.Enter:
-                self.image_view.set_external_highlight(idx)
-                return False
-            if event.type() == QEvent.Leave:
-                self.image_view.clear_external_highlight(idx)
-                return False
-            if event.type() == QEvent.MouseButtonDblClick:
-                # Handle double-click to select profile
-                if 0 <= idx < len(self.face_profile_ids):
-                    profile_id = self.face_profile_ids[idx]
-                    if profile_id is not None:
-                        self.faceDoubleClicked.emit(profile_id)
-                return True
-        return super().eventFilter(obj, event)
 
 
 class ProfilePanel(QWidget):
@@ -2060,9 +2036,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.unload_btn)
         left = QWidget()
         left.setLayout(left_layout)
-        self.panel = FacePanel()
+        self.panel = ImagePanel()
         self.panel.image_view.hoverFaceChanged.connect(self.on_face_hover)
-        self.panel.faceDoubleClicked.connect(self.on_face_double_clicked)
+        self.panel.image_view.boxDoubleClicked.connect(self.on_box_double_clicked)
+        self.panel.image_view.labelDoubleClicked.connect(self.on_label_double_clicked)
         self.profile_panel = ProfilePanel()
         self.profile_panel.profileSelected.connect(self.on_profile_selected)
         self.profile_panel.occurrenceActivated.connect(self.on_occurrence_activated)
@@ -2119,7 +2096,8 @@ class MainWindow(QMainWindow):
         self.current_faces = []
         self.is_blurred = False
         self.current_image_path = None
-        self.analysis_cache = {}
+        self.analysis_cache = OrderedDict()
+        self.max_cache_size = 50  # Maximum number of images to keep in memory
 
         # Get max_people from current project if available
         max_people = self.current_project.max_people if self.current_project else None
@@ -2905,11 +2883,15 @@ class MainWindow(QMainWindow):
                 "clusters": clusters,
                 "profile_ids": profile_ids,
                 "occurrences": occurrences,
+                "_last_labels": labels,  # Cache labels for optimization
             }
-            self.analysis_cache[path] = entry
+            self._add_to_cache(path, entry)
 
             # Save to database
             self._save_to_database(path, mtime, occurrences, profile_ids, detections)
+
+            # Clean up result dict to free memory from worker thread
+            result.clear()
 
         except Exception as e:
             import traceback
@@ -2947,6 +2929,14 @@ class MainWindow(QMainWindow):
         # Update display
         self.profile_panel.set_profiles(self.profile_manager.profiles())
 
+        # Clean up worker thread
+        if self.batch_worker:
+            self.batch_worker.deleteLater()
+            self.batch_worker = None
+
+        # Force garbage collection after batch processing
+        gc.collect()
+
         # Show completion message
         QMessageBox.information(
             self,
@@ -2962,7 +2952,11 @@ class MainWindow(QMainWindow):
         """Handle recognition model change - reset profiles and clear cache"""
         self.recognition_model = model_name
         # Clear cache since embeddings will be different with new model
+        # Clean up each entry before clearing
+        for entry in list(self.analysis_cache.values()):
+            self._cleanup_cache_entry(entry)
         self.analysis_cache.clear()
+        gc.collect()
         # Reset profile manager with new model
         self.profile_manager = FaceProfileManager(
             distance_threshold=self.distance_threshold,
@@ -2983,7 +2977,8 @@ class MainWindow(QMainWindow):
         if entry and entry.get("mtime") == mtime:
             return entry
         if entry:
-            self.profile_manager.remove_image_occurrences(path)
+            # Remove old occurrences when re-analyzing (ignore return value)
+            _ = self.profile_manager.remove_image_occurrences(path)
         data = np.fromfile(path, dtype=np.uint8)
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
@@ -2992,6 +2987,9 @@ class MainWindow(QMainWindow):
         clusters = cluster_detections(detections)
         occurrences = []
         profile_ids = []
+        # Track which profiles have been assigned in this image to prevent duplicates
+        assigned_profiles_in_image = set()
+
         for idx, det in enumerate(detections):
             crop = det.get("crop")
             embedding = compute_face_embedding(crop, model_name=self.recognition_model)
@@ -3011,8 +3009,11 @@ class MainWindow(QMainWindow):
                 embedding=embedding,
                 face_image=face_img,
             )
-            profile = self.profile_manager.assign_profile(occurrence)
+            # Pass already assigned profiles as exclusions to prevent duplicates
+            profile = self.profile_manager.assign_profile(occurrence, exclude_profile_ids=assigned_profiles_in_image)
             profile_ids.append(profile.profile_id)
+            # Add this profile to the set of assigned profiles in this image
+            assigned_profiles_in_image.add(profile.profile_id)
             occurrences.append(occurrence)
         color_ids = profile_ids if profile_ids else clusters
         # Get labels for each detection
@@ -3027,13 +3028,51 @@ class MainWindow(QMainWindow):
             "clusters": clusters,
             "profile_ids": profile_ids,
             "occurrences": occurrences,
+            "_last_labels": labels,  # Cache labels for optimization
         }
-        self.analysis_cache[path] = entry
+        self._add_to_cache(path, entry)
 
         # Save to database
         self._save_to_database(path, mtime, occurrences, profile_ids, detections)
 
         return entry
+
+    def _add_to_cache(self, path: str, entry: dict):
+        """Add entry to cache with LRU eviction."""
+        # If path already exists, move it to end (most recently used)
+        if path in self.analysis_cache:
+            self.analysis_cache.move_to_end(path)
+        else:
+            # Add new entry
+            self.analysis_cache[path] = entry
+
+        # Evict oldest entries if cache is too large
+        while len(self.analysis_cache) > self.max_cache_size:
+            # Remove oldest (first) item
+            oldest_path, oldest_entry = self.analysis_cache.popitem(last=False)
+            # Clean up memory
+            self._cleanup_cache_entry(oldest_entry)
+
+        # Periodic garbage collection
+        if len(self.analysis_cache) % 10 == 0:
+            gc.collect()
+
+    def _cleanup_cache_entry(self, entry: dict):
+        """Clean up memory for a cache entry."""
+        if entry:
+            # Clear large numpy arrays
+            if 'original' in entry:
+                del entry['original']
+            if 'annotated' in entry:
+                del entry['annotated']
+            if 'faces' in entry:
+                del entry['faces']
+            if 'occurrences' in entry:
+                for occ in entry['occurrences']:
+                    if hasattr(occ, 'face_image'):
+                        occ.face_image = None
+                    if hasattr(occ, 'embedding'):
+                        occ.embedding = None
 
     def _save_all_profiles(self):
         """Save all profiles to database."""
@@ -3045,8 +3084,11 @@ class MainWindow(QMainWindow):
             print(f"Error saving profiles to database: {e}")
 
     def _save_to_database(self, path: str, mtime: float, occurrences, profile_ids, detections):
-        """Save analysis results to database."""
+        """Save analysis results to database using batch operations for performance."""
         try:
+            # Begin transaction for all operations
+            self.db.begin_transaction()
+
             # Get or create image record
             image_id = self.db.get_image_id(path)
             if image_id is None:
@@ -3055,33 +3097,48 @@ class MainWindow(QMainWindow):
             # Delete old detections for this image
             self.db.delete_detections_for_image(image_id)
 
-            # Save profiles
+            # Prepare batch data for profiles
+            profiles_to_save = []
             for pid in set(profile_ids):
                 if pid:
                     profile = self.profile_manager.get_profile(pid)
                     if profile:
-                        self.db.save_profile(pid, profile.label)
+                        profiles_to_save.append((pid, profile.label))
 
-            # Save detections
+            # Save all profiles in one batch
+            if profiles_to_save:
+                self.db.save_profiles_batch(profiles_to_save)
+
+            # Prepare batch data for detections
+            detections_to_save = []
             for idx, (occurrence, det) in enumerate(zip(occurrences, detections)):
                 if occurrence and det:
                     score = det.get("score", 0.0)
                     emb = occurrence.get_embedding()
-                    self.db.save_detection(
-                        image_id=image_id,
-                        profile_id=emb is not None and profile_ids[idx] or None,
-                        detection_index=idx,
-                        box=occurrence.box,
-                        score=score,
-                        embedding=emb,
-                        face_image=occurrence.face_image
-                    )
+                    detections_to_save.append({
+                        'image_id': image_id,
+                        'profile_id': emb is not None and profile_ids[idx] or None,
+                        'detection_index': idx,
+                        'box': occurrence.box,
+                        'score': score,
+                        'embedding': emb,
+                        'face_image': None  # Don't store face images - save space
+                    })
+
+            # Save all detections in one batch
+            if detections_to_save:
+                self.db.save_detection_batch(detections_to_save)
 
             # Mark image as processed
             self.db.mark_image_processed(image_id)
 
+            # Commit the transaction
+            self.db.commit_transaction()
+
         except Exception as e:
             print(f"Error saving to database: {e}")
+            # Rollback on error
+            self.db.rollback_transaction()
 
     def on_selection_changed(self):
         """Handle gallery selection changes to update unload button state."""
@@ -3184,8 +3241,9 @@ class MainWindow(QMainWindow):
                 "clusters": clusters,
                 "profile_ids": profile_ids,
                 "occurrences": occurrences,
+                "_last_labels": labels,  # Cache labels for optimization
             }
-            self.analysis_cache[path] = entry
+            self._add_to_cache(path, entry)
 
             # Save to database
             self._save_to_database(path, mtime, occurrences, profile_ids, detections)
@@ -3213,7 +3271,7 @@ class MainWindow(QMainWindow):
         print(f"Loaded {os.path.basename(path)} from database cache")
 
         # Store in cache
-        self.analysis_cache[path] = entry
+        self._add_to_cache(path, entry)
 
         # Display the image
         self._display_image_entry(path, entry)
@@ -3243,15 +3301,7 @@ class MainWindow(QMainWindow):
         pixmap = cv_to_qpixmap(annotated) if annotated is not None else QPixmap()
         self.panel.show_image(pixmap)
         detections = entry.get("detections", [])
-        self.panel.image_view.set_detections(detections, color_ids)
-        face_pixmaps = [cv_to_qpixmap(face) for face in entry.get("faces", [])]
-        face_labels = labels if labels else [""] * len(face_pixmaps)
-        self.panel.set_faces(
-            face_pixmaps,
-            color_ids,
-            labels=face_labels,
-            profile_ids=entry.get("profile_ids", [])
-        )
+        self.panel.image_view.set_detections(detections, color_ids, labels)
         original = entry.get("original")
         self.current_image_original = original.copy() if original is not None else None
         self.current_annotated_image = annotated.copy() if annotated is not None else None
@@ -3282,8 +3332,6 @@ class MainWindow(QMainWindow):
             ]
             if indices:
                 idx = indices[0]
-                color_id = profile_id if idx >= len(self.current_color_ids) else self.current_color_ids[idx]
-                self.panel.highlight_face(idx, color_id)
                 self.panel.image_view.set_external_highlight(idx)
 
     def on_occurrence_activated(self, image_path, detection_index):
@@ -3309,6 +3357,24 @@ class MainWindow(QMainWindow):
         existing_profile_id = self.profile_manager.find_profile_by_label(new_name)
 
         if existing_profile_id is not None and existing_profile_id != profile_id:
+            # Check if merge would create duplicates
+            has_duplicates, duplicate_images = self._would_merge_create_duplicates(profile_id, existing_profile_id)
+            if has_duplicates:
+                # Show warning and prevent merge
+                image_list = "\n".join([f"  • {path}" for path in duplicate_images[:5]])
+                if len(duplicate_images) > 5:
+                    image_list += f"\n  ... and {len(duplicate_images) - 5} more"
+
+                QMessageBox.warning(
+                    self,
+                    "Cannot Merge Profiles",
+                    f"Cannot merge these profiles because the following image(s) contain both profiles:\n\n"
+                    f"{image_list}\n\n"
+                    f"Each person can only appear once per image. Please reassign individual appearances "
+                    f"instead of merging the entire profiles."
+                )
+                return
+
             # Merge profiles
             print(f"Merging profile {profile_id} into profile {existing_profile_id} (name: {new_name})")
             success = self.profile_manager.merge_profiles(profile_id, existing_profile_id)
@@ -3389,12 +3455,9 @@ class MainWindow(QMainWindow):
         self.pending_highlight = None
         if index is None or index < 0:
             self.panel.image_view.clear_external_highlight()
-            self.panel.highlight_face(-1)
             return
         if index >= len(self.current_detections):
             return
-        color_id = self.current_color_ids[index] if index < len(self.current_color_ids) else -1
-        self.panel.highlight_face(index, color_id)
         self.panel.image_view.set_external_highlight(index)
 
     def _get_labels_for_current_detections(self):
@@ -3427,11 +3490,15 @@ class MainWindow(QMainWindow):
         if original is None or not isinstance(original, np.ndarray) or not detections:
             color_ids = profile_ids if profile_ids else clusters
             labels = self._get_labels_for_profile_ids(profile_ids) if profile_ids else []
-            return entry.get("annotated"), color_ids, labels
+            # If no original image but annotated exists, still return it with current labels
+            annotated = entry.get("annotated")
+            return annotated, color_ids, labels
 
         color_ids = list(profile_ids) if profile_ids else list(clusters)
         if len(color_ids) < len(detections):
             color_ids.extend([0] * (len(detections) - len(color_ids)))
+
+        # Always get current labels from profile manager
         labels = self._get_labels_for_profile_ids(profile_ids) if profile_ids else []
         if len(labels) < len(detections):
             labels.extend([""] * (len(detections) - len(labels)))
@@ -3443,11 +3510,13 @@ class MainWindow(QMainWindow):
             # Check if we need to redraw (i.e., if labels might have changed)
             # We store the last used labels in the entry to detect changes
             last_labels = entry.get("_last_labels")
-            if last_labels == labels:
+            # Only skip redraw if last_labels exists AND matches current labels
+            if last_labels is not None and last_labels == labels:
                 # Labels haven't changed, use existing annotated image
                 return existing_annotated, color_ids, labels
+            # If labels have changed or _last_labels is missing, we need to redraw
 
-        # Draw new annotated image
+        # Draw new annotated image with current labels
         annotated = draw_face_boxes(original.copy(), detections, color_ids, labels=labels)
         entry["annotated"] = annotated
         entry["_last_labels"] = labels  # Cache labels for next comparison
@@ -3468,11 +3537,7 @@ class MainWindow(QMainWindow):
 
         pixmap = cv_to_qpixmap(annotated)
         self.panel.show_image(pixmap)
-        self.panel.image_view.set_detections(entry.get("detections", []), color_ids)
-        faces = entry.get("faces", [])
-        face_pixmaps = [cv_to_qpixmap(face) for face in faces]
-        face_labels = labels if labels else [""] * len(face_pixmaps)
-        self.panel.set_faces(face_pixmaps, color_ids, labels=face_labels, profile_ids=entry.get("profile_ids", []))
+        self.panel.image_view.set_detections(entry.get("detections", []), color_ids, labels)
         self.current_annotated_image = annotated
         self.current_color_ids = list(color_ids)
         self.current_profile_ids = list(entry.get("profile_ids", []))
@@ -3534,8 +3599,6 @@ class MainWindow(QMainWindow):
                         k += 1
                     blurred_faces.append(cv2.GaussianBlur(face, (k, k), 0))
                 self.current_blurred_faces = [face.copy() for face in blurred_faces]
-            face_labels = self._get_labels_for_current_detections()
-            self.panel.set_faces([cv_to_qpixmap(face) for face in self.current_blurred_faces], self.current_color_ids, labels=face_labels, profile_ids=self.current_profile_ids)
             self.current_faces = [face.copy() for face in self.current_blurred_faces]
             self.is_blurred = True
             self.blur_btn.setText("Unblur Faces")
@@ -3549,29 +3612,326 @@ class MainWindow(QMainWindow):
                 self.current_annotated_image = annotated.copy() if annotated is not None else None
             pixmap = cv_to_qpixmap(annotated) if annotated is not None else QPixmap()
             self.panel.show_image(pixmap, reset_view=False)
-            face_labels = self._get_labels_for_current_detections()
-            self.panel.set_faces([cv_to_qpixmap(face) for face in self.current_faces_original], self.current_color_ids, labels=face_labels, profile_ids=self.current_profile_ids)
             self.current_faces = [face.copy() for face in self.current_faces_original]
             self.is_blurred = False
             self.blur_btn.setText("Blur Faces")
             # Also unblur profile panel faces
             self.profile_panel.set_profiles(self.profile_manager.profiles(), blur_faces=False)
 
-    def on_face_double_clicked(self, profile_id):
-        """Handle double-click on face thumbnail - select the profile"""
+    def on_face_hover(self, index):
+        """Handle face hover - no longer highlights faces in panel since face panel removed"""
+        pass
+
+    def _profile_exists_in_current_image(self, profile_id, exclude_face_index=None):
+        """
+        Check if a profile already exists in the current image.
+
+        Args:
+            profile_id: The profile ID to check
+            exclude_face_index: Optional face index to exclude from the check (for reassignment)
+
+        Returns:
+            True if profile exists in current image, False otherwise
+        """
+        if not self.current_profile_ids:
+            return False
+
+        for idx, pid in enumerate(self.current_profile_ids):
+            if exclude_face_index is not None and idx == exclude_face_index:
+                continue
+            if pid == profile_id:
+                return True
+        return False
+
+    def _would_merge_create_duplicates(self, source_profile_id, target_profile_id):
+        """
+        Check if merging two profiles would create duplicate profiles in any image.
+
+        Args:
+            source_profile_id: The profile to be merged (will be removed)
+            target_profile_id: The target profile to merge into
+
+        Returns:
+            Tuple of (has_duplicates, image_paths) where image_paths is a list of images with both profiles
+        """
+        images_with_duplicates = []
+
+        # Check cache entries
+        for path, entry in self.analysis_cache.items():
+            profile_ids = entry.get("profile_ids", [])
+            if source_profile_id in profile_ids and target_profile_id in profile_ids:
+                images_with_duplicates.append(path)
+
+        # Also check database for images not in cache
+        # Get all images with source profile
+        source_profile = self.profile_manager.get_profile(source_profile_id)
+        if source_profile:
+            for occ in source_profile.occurrences:
+                if occ.image_path in images_with_duplicates:
+                    continue  # Already found in cache
+
+                # Check if this image also has target profile
+                target_profile = self.profile_manager.get_profile(target_profile_id)
+                if target_profile:
+                    for target_occ in target_profile.occurrences:
+                        if target_occ.image_path == occ.image_path:
+                            images_with_duplicates.append(occ.image_path)
+                            break
+
+        return (len(images_with_duplicates) > 0, images_with_duplicates)
+
+    def on_box_double_clicked(self, face_index):
+        """Handle double-click on bounding box - select the profile"""
+        if face_index < 0 or face_index >= len(self.current_profile_ids):
+            return
+
+        profile_id = self.current_profile_ids[face_index]
         if profile_id is not None:
             # Select the profile in the profile panel
             self.profile_panel.select_profile_by_id(profile_id)
 
-    def on_face_hover(self, index):
-        if not self.current_faces:
-            self.panel.highlight_face(-1)
+    def on_label_double_clicked(self, face_index):
+        """Handle double-click on label - show rename dialog to change profile assignment"""
+        from PyQt5.QtWidgets import QInputDialog
+
+        # Validate face_index
+        if face_index < 0 or face_index >= len(self.current_detections):
             return
-        if index < 0 or index >= len(self.current_faces):
-            self.panel.highlight_face(-1)
+
+        if not self.current_image_path:
+            return
+
+        # Get the current profile for this face
+        old_profile_id = self.current_profile_ids[face_index] if face_index < len(self.current_profile_ids) else None
+        if not old_profile_id:
+            return
+
+        old_profile = self.profile_manager.get_profile(old_profile_id)
+        if not old_profile:
+            return
+
+        # Show dialog to rename/reassign
+        current_name = old_profile.label
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Appearance",
+            "Enter new profile name for this appearance:",
+            text=current_name
+        )
+
+        if not ok or not new_name or not new_name.strip():
+            return
+
+        new_name = new_name.strip()
+
+        # Find the detection index
+        detection_index = face_index
+
+        # Find the occurrence to reassign
+        occurrence_to_reassign = None
+        for occ in old_profile.occurrences:
+            if occ.image_path == self.current_image_path and occ.detection_index == detection_index:
+                occurrence_to_reassign = occ
+                break
+
+        if not occurrence_to_reassign:
+            return
+
+        # Check if new_name matches an existing profile
+        target_profile_id = self.profile_manager.find_profile_by_label(new_name)
+
+        if target_profile_id:
+            # Check if this profile already exists in the current image (excluding this face)
+            if self._profile_exists_in_current_image(target_profile_id, exclude_face_index=face_index):
+                QMessageBox.warning(
+                    self,
+                    "Duplicate Profile",
+                    f"The profile '{new_name}' already exists in this image.\n\n"
+                    f"Each person can only appear once per image."
+                )
+                return
+            # Reassign to existing profile
+            target_profile = self.profile_manager.get_profile(target_profile_id)
+            if target_profile:
+                # Remove from old profile
+                old_profile.occurrences.remove(occurrence_to_reassign)
+                if old_profile.occurrences:
+                    old_profile.embedding_sum = np.sum([occ.embedding for occ in old_profile.occurrences], axis=0).astype(np.float32)
+                    old_profile.occurrence_count = len(old_profile.occurrences)
+                else:
+                    # Delete empty profile
+                    del self.profile_manager._profiles[old_profile_id]
+                    self.db.delete_profile(old_profile_id)
+
+                # Add to target profile
+                target_profile.add_occurrence(occurrence_to_reassign)
+
+                # Update database
+                image_id = self.db.get_image_id(self.current_image_path)
+                if image_id:
+                    detections = self.db.get_detections_for_image(image_id)
+                    for det in detections:
+                        if (det['profile_id'] == old_profile_id and
+                            det['detection_index'] == detection_index):
+                            self.db.update_detection_profile(det['id'], target_profile_id)
+                            break
+
+                # Save profiles
+                self.db.save_profile(target_profile_id, target_profile.label)
+
+                # Update the current profile_ids for the display
+                self.current_profile_ids[face_index] = target_profile_id
         else:
-            cluster_id = self.current_color_ids[index] if index < len(self.current_color_ids) else -1
-            self.panel.highlight_face(index, cluster_id)
+            # Create new profile with new_name
+            from recognition import FaceProfile
+            new_profile_id = self.profile_manager._next_profile_id
+            self.profile_manager._next_profile_id += 1
+
+            new_profile = FaceProfile(profile_id=new_profile_id, label=new_name)
+            self.profile_manager._profiles[new_profile_id] = new_profile
+
+            # Remove from old profile
+            old_profile.occurrences.remove(occurrence_to_reassign)
+            if old_profile.occurrences:
+                old_profile.embedding_sum = np.sum([occ.embedding for occ in old_profile.occurrences], axis=0).astype(np.float32)
+                old_profile.occurrence_count = len(old_profile.occurrences)
+            else:
+                # Delete empty profile
+                del self.profile_manager._profiles[old_profile_id]
+                self.db.delete_profile(old_profile_id)
+
+            # Add to new profile
+            new_profile.add_occurrence(occurrence_to_reassign)
+
+            # Update database
+            self.db.save_profile(new_profile_id, new_profile.label)
+            image_id = self.db.get_image_id(self.current_image_path)
+            if image_id:
+                detections = self.db.get_detections_for_image(image_id)
+                for det in detections:
+                    if (det['profile_id'] == old_profile_id and
+                        det['detection_index'] == detection_index):
+                        self.db.update_detection_profile(det['id'], new_profile_id)
+                        break
+
+            # Update the current profile_ids for the display
+            self.current_profile_ids[face_index] = new_profile_id
+
+        # Refresh display
+        self.profile_panel.set_profiles(self.profile_manager.profiles())
+
+        # Refresh the current image display to show updated labels
+        if self.current_image_path:
+            self.on_select(self.gallery.currentRow())
+
+    def on_appearance_rename_requested_DEPRECATED(self, face_index, new_name):
+        """Handle renaming an appearance from the face panel"""
+        # Validate face_index
+        if face_index < 0 or face_index >= len(self.current_detections):
+            return
+
+        if not self.current_image_path:
+            return
+
+        # Get the current profile for this face
+        old_profile_id = self.current_profile_ids[face_index] if face_index < len(self.current_profile_ids) else None
+        if not old_profile_id:
+            return
+
+        old_profile = self.profile_manager.get_profile(old_profile_id)
+        if not old_profile:
+            return
+
+        # Find the detection index
+        detection_index = face_index
+
+        # Find the occurrence to reassign
+        occurrence_to_reassign = None
+        for occ in old_profile.occurrences:
+            if occ.image_path == self.current_image_path and occ.detection_index == detection_index:
+                occurrence_to_reassign = occ
+                break
+
+        if not occurrence_to_reassign:
+            return
+
+        # Check if new_name matches an existing profile
+        target_profile_id = self.profile_manager.find_profile_by_label(new_name)
+
+        if target_profile_id:
+            # Reassign to existing profile
+            target_profile = self.profile_manager.get_profile(target_profile_id)
+            if target_profile:
+                # Remove from old profile
+                old_profile.occurrences.remove(occurrence_to_reassign)
+                if old_profile.occurrences:
+                    old_profile.embedding_sum = np.sum([occ.embedding for occ in old_profile.occurrences], axis=0).astype(np.float32)
+                    old_profile.occurrence_count = len(old_profile.occurrences)
+                else:
+                    # Delete empty profile
+                    del self.profile_manager._profiles[old_profile_id]
+                    self.db.delete_profile(old_profile_id)
+
+                # Add to target profile
+                target_profile.add_occurrence(occurrence_to_reassign)
+
+                # Update database
+                image_id = self.db.get_image_id(self.current_image_path)
+                if image_id:
+                    detections = self.db.get_detections_for_image(image_id)
+                    for det in detections:
+                        if (det['profile_id'] == old_profile_id and
+                            det['detection_index'] == detection_index):
+                            self.db.update_detection_profile(det['id'], target_profile_id)
+                            break
+
+                # Save profiles
+                self.db.save_profile(target_profile_id, target_profile.label)
+
+                # Update the current profile_ids for the display
+                self.current_profile_ids[face_index] = target_profile_id
+        else:
+            # Create new profile with new_name
+            from recognition import FaceProfile
+            new_profile_id = self.profile_manager._next_profile_id
+            self.profile_manager._next_profile_id += 1
+
+            new_profile = FaceProfile(profile_id=new_profile_id, label=new_name)
+            self.profile_manager._profiles[new_profile_id] = new_profile
+
+            # Remove from old profile
+            old_profile.occurrences.remove(occurrence_to_reassign)
+            if old_profile.occurrences:
+                old_profile.embedding_sum = np.sum([occ.embedding for occ in old_profile.occurrences], axis=0).astype(np.float32)
+                old_profile.occurrence_count = len(old_profile.occurrences)
+            else:
+                # Delete empty profile
+                del self.profile_manager._profiles[old_profile_id]
+                self.db.delete_profile(old_profile_id)
+
+            # Add to new profile
+            new_profile.add_occurrence(occurrence_to_reassign)
+
+            # Update database
+            self.db.save_profile(new_profile_id, new_profile.label)
+            image_id = self.db.get_image_id(self.current_image_path)
+            if image_id:
+                detections = self.db.get_detections_for_image(image_id)
+                for det in detections:
+                    if (det['profile_id'] == old_profile_id and
+                        det['detection_index'] == detection_index):
+                        self.db.update_detection_profile(det['id'], new_profile_id)
+                        break
+
+            # Update the current profile_ids for the display
+            self.current_profile_ids[face_index] = new_profile_id
+
+        # Refresh display
+        self.profile_panel.set_profiles(self.profile_manager.profiles())
+
+        # Refresh the current image display to show updated labels
+        if self.current_image_path:
+            self.on_select(self.gallery.currentRow())
 
     def on_see_all_faces(self):
         """Open the Faces and People window"""
@@ -3824,71 +4184,87 @@ class MainWindow(QMainWindow):
             if path:
                 paths_to_unload.append(path)
 
-        # Remove from cache, database, and profile manager
-        profiles_to_check = set()
+        if not paths_to_unload:
+            return
 
-        for path in paths_to_unload:
-            # Remove from cache
-            if path in self.analysis_cache:
-                del self.analysis_cache[path]
+        # Show progress dialog
+        progress = QProgressDialog("Unloading images...", "Cancel", 0, len(paths_to_unload), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
 
-            # Track which profiles are affected
-            for profile in self.profile_manager.profiles():
-                for occ in profile.occurrences:
-                    if occ.image_path == path:
-                        profiles_to_check.add(profile.profile_id)
-                        break
+        # Disable UI during unload
+        self.setEnabled(False)
 
-            # Remove from profile manager occurrences
-            self.profile_manager.remove_image_occurrences(path)
+        try:
+            # Process each image
+            all_empty_profile_ids = set()
 
-            # Delete image and all its detections from database (CASCADE will handle detections)
-            self.db.delete_image(path)
+            for idx, path in enumerate(paths_to_unload):
+                if progress.wasCanceled():
+                    break
 
-            # Remove from images list
-            if path in self.images:
-                self.images.remove(path)
+                progress.setLabelText(f"Unloading {os.path.basename(path)}...")
+                progress.setValue(idx)
+                QApplication.processEvents()  # Keep UI responsive
 
-        # Check profiles and delete empty ones
-        empty_profile_ids = []
-        for profile_id in profiles_to_check:
-            profile = self.profile_manager.get_profile(profile_id)
-            if profile and profile.occurrence_count == 0:
-                empty_profile_ids.append(profile_id)
+                # Remove from cache
+                if path in self.analysis_cache:
+                    entry = self.analysis_cache[path]
+                    self._cleanup_cache_entry(entry)
+                    del self.analysis_cache[path]
 
-        # Delete empty profiles
-        for profile_id in empty_profile_ids:
-            if profile_id in self.profile_manager._profiles:
-                del self.profile_manager._profiles[profile_id]
+                # Remove from profile manager occurrences (returns list of empty profile IDs)
+                _, empty_profile_ids = self.profile_manager.remove_image_occurrences(path)
+                all_empty_profile_ids.update(empty_profile_ids)
+
+                # Delete image and all its detections from database (CASCADE will handle detections)
+                self.db.delete_image(path)
+
+                # Remove from images list
+                if path in self.images:
+                    self.images.remove(path)
+
+            # Delete empty profiles from database (already deleted from profile_manager)
+            for profile_id in all_empty_profile_ids:
                 self.db.delete_profile(profile_id)
                 print(f"Deleted empty profile {profile_id}")
 
-        # Remove items from gallery list widget
-        for item in selected_items:
-            row = self.gallery.row(item)
-            self.gallery.takeItem(row)
+            # Remove items from gallery list widget
+            for item in selected_items:
+                row = self.gallery.row(item)
+                self.gallery.takeItem(row)
 
-        # Clear current display if the current image was unloaded
-        if self.current_image_path in paths_to_unload:
-            self.current_image_path = None
-            self.current_image_original = None
-            self.current_annotated_image = None
-            self.panel.show_image(QPixmap())
-            self.panel.set_faces([])
+            # Clear current display if the current image was unloaded
+            if self.current_image_path in paths_to_unload:
+                self.current_image_path = None
+                self.current_image_original = None
+                self.current_annotated_image = None
+                self.current_detections = []
+                self.current_profile_ids = []
+                self.panel.show_image(QPixmap())
 
-        # Update profile panel
-        self.profile_panel.set_profiles(self.profile_manager.profiles())
+            # Update profile panel
+            self.profile_panel.set_profiles(self.profile_manager.profiles())
 
-        # Disable buttons if no images left
-        if not self.images:
-            self.process_all_btn.setEnabled(False)
+            # Disable buttons if no images left
+            if not self.images:
+                self.process_all_btn.setEnabled(False)
 
-        # Update unload button state
-        self.on_selection_changed()
+            # Update unload button state
+            self.on_selection_changed()
 
-        image_word = "image" if len(paths_to_unload) == 1 else "images"
-        QMessageBox.information(
-            self,
-            "Images Unloaded",
-            f"Successfully unloaded {len(paths_to_unload)} {image_word}"
-        )
+            progress.setValue(len(paths_to_unload))
+
+            # Show completion message
+            image_word = "image" if len(paths_to_unload) == 1 else "images"
+            QMessageBox.information(
+                self,
+                "Images Unloaded",
+                f"Successfully unloaded {len(paths_to_unload)} {image_word}"
+            )
+
+        finally:
+            # Re-enable UI
+            self.setEnabled(True)
+            progress.close()
